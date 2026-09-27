@@ -457,6 +457,45 @@ restic stats latest
 subset argument it re-downloads the whole repository. Worth doing occasionally
 over the LAN, not over a slow link.
 
+## Changing the schedule
+
+The scheduled time lives in two places that must agree: Task Scheduler (or the systemd
+timer), which actually fires it, and `config.json`, which records the intent. One
+command changes both:
+
+```powershell
+.\Setup-ResticBackup.ps1 -TaskTime 03:30 -Only 8
+```
+```bash
+sudo ./setup-restic-backup.sh --on-calendar '*-*-* 03:30' --only 8
+```
+
+Step 8 re-registers the task with the new time and writes it back to `config.json`, then
+prints the next run. Nothing else is touched, and no other parameter has to be repeated —
+they come from the stored config.
+
+The same works for the execution time limit (`-TimeLimitHours`), for `-WakeToRun`, and on
+Linux for the same-day retry (`--retry-calendar`).
+
+**Do not change the time in taskschd.msc.** The GUI edit works until the next `-From 8`,
+which re-registers the task from `config.json` and silently puts it back. The config file
+is the source of truth; the task is a projection of it.
+
+To check what is actually scheduled:
+
+```powershell
+restic-ctl status                      # scheduler section, with the next run
+Get-ScheduledTaskInfo restic-backup
+```
+```bash
+sudo restic-ctl status
+systemctl list-timers restic-backup.timer
+```
+
+Editing `config.json` by hand and running step 8 works too, and is the better route for
+retention or backup paths — those are read by the backup script on every run, so they need
+no re-registration at all.
+
 ## Suspend, battery and interrupted runs
 
 A suspend mid-backup drops the SSH connection and the run fails. On a laptop this is

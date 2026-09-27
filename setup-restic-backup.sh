@@ -1104,6 +1104,31 @@ EOF
     systemctl daemon-reload
     systemctl enable --now restic-backup.timer >/dev/null 2>&1
     ok "restic-backup.timer enabled (OnCalendar=$ON_CALENDAR, Persistent=true)"
+
+    # Step 8 owns the timer, config.json owns the intent. Without this, running
+    # "--only 8 --on-calendar ..." changed the timer while config.json still held the old
+    # value, and the next "--from 3" would quietly put it back.
+    if [ -f "$CONFIG" ]; then
+        ON_CALENDAR="$ON_CALENDAR" RETRY_CALENDAR="$RETRY_CALENDAR" \
+        python3 -c '
+import json, os, sys
+p = sys.argv[1]
+with open(p) as f:
+    d = json.load(f)
+s = d.setdefault("schedule", {})
+before = dict(s)
+s["onCalendar"] = os.environ["ON_CALENDAR"]
+s["retryCalendar"] = os.environ["RETRY_CALENDAR"]
+if s != before:
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, p)
+    print("updated")
+' "$CONFIG" 2>/dev/null | grep -q updated \
+            && ok "config.json updated: OnCalendar=$ON_CALENDAR, retry=$RETRY_CALENDAR"
+    fi
     info "next run: $(systemctl show -p NextElapseUSecRealtime --value restic-backup.timer 2>/dev/null)"
 fi
 

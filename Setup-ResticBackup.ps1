@@ -461,6 +461,35 @@ echo 'Back on the client, continue with:  Setup-ResticBackup.ps1 -From 6'
     return $target
 }
 
+# Step 8 owns the scheduled task, but config.json owns the intent. Without this, running
+# "-Only 8 -TaskTime 03:30" changed the task while config.json still said 13:00, and the
+# next "-From 3" would quietly put the task back. Same drift as the parameters that used
+# to revert, just narrower.
+function Update-StoredSchedule {
+    if (-not (Test-Path $ConfigFile)) { return }
+    try { $cfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json } catch { return }
+    if (-not $cfg.PSObject.Properties['schedule']) {
+        $cfg | Add-Member -NotePropertyName schedule -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $sched = $cfg.schedule
+    $changed = $false
+    foreach ($pair in @(@('time', $TaskTime), @('timeLimitHours', $TimeLimitHours))) {
+        $name, $value = $pair
+        if (-not $sched.PSObject.Properties[$name]) {
+            $sched | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
+            $changed = $true
+        } elseif ("$($sched.$name)" -ne "$value") {
+            $sched.$name = $value
+            $changed = $true
+        }
+    }
+    if (-not $changed) { return }
+    [System.IO.File]::WriteAllText($ConfigFile,
+        (($cfg | ConvertTo-Json -Depth 5) + "`r`n"),
+        (New-Object System.Text.UTF8Encoding($false)))
+    Write-Ok "config.json updated: schedule $TaskTime, time limit $TimeLimitHours h"
+}
+
 function Show-NasProvisionInstructions {
     $provision = Write-NasProvisionScript
     if (-not $provision) { return }
@@ -1387,6 +1416,11 @@ if ((Should-Run 8) -and -not $SkipTask) {
         Write-Info 'WakeToRun: wakes the machine at the scheduled time.'
     } else {
         Write-Info '-WakeToRun would wake a sleeping machine to run (off by default).'
+    }
+    Update-StoredSchedule
+    $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($info -and $info.NextRunTime) {
+        Write-Info ("next run: {0:yyyy-MM-dd HH:mm}" -f $info.NextRunTime)
     }
 }
 
