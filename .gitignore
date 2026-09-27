@@ -1,0 +1,28 @@
+# Generated per machine by step 4 of the installer. Each one embeds THAT machine's
+# public key, so committing them invites copying one to another machine - which would
+# authorize the wrong machine on that NAS account. They are cheap to regenerate:
+#   Setup-ResticBackup.ps1 -NasSetup      /      setup-restic-backup.sh --nas-setup
+nas-provision-*.sh
+
+# Superseded first drafts. Kept on disk for reference, no value in history.
+reference/
+
+# --- Defensive: none of this belongs in the repo, ever ---------------------------
+# Credentials and per-machine state live in C:\ProgramData\restic (Windows) and
+# /etc/restic (Linux), never beside the scripts. These patterns exist so that a
+# careless copy into this folder cannot be committed by accident.
+password
+config.json
+settings.psd1*
+settings.env*
+id_ed25519*
+*.pem
+*.key
+known_hosts
+progress.json
+last-run.json
+history.jsonl
+excludes.txt
+excludes.txt.bak
+*.log
+*.migrated
