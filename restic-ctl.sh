@@ -10,9 +10,11 @@
 #    run         start a backup THROUGH SYSTEMD, in the same context the timer
 #                uses, and follow it
 #    check       verify repository integrity
+#    schedule    show or change when the backup runs
 #    history     table of recent runs, including failed ones
 #    log         tail the backup log
 #    config      the effective settings of this machine
+#    help        the command list, or the detail for one command
 #
 #  And, as a wrapper over restic itself, so the repository, the password file
 #  and the sftp.command never have to be retyped:
@@ -54,11 +56,362 @@ REST=''
 # cannot afford downloading everything at once.
 SUBSET='1/12'
 
-usage() { sed -n '3,26p' "$0" | sed 's/^#//; s/^ //'; }
+RETRY=''
 
+# ------------------------------------------------------------------- help
+#
+# Deliberately not "sed -n '3,26p' $0" any more: that printed the header comment and
+# nothing about the options, which is how you end up guessing at --subset. Handled
+# before the root check and before config.json is read, so help works on a machine
+# with no backup configured and from an unprivileged shell.
+
+usage() {
+    cat <<'USAGE_EOF'
+restic-ctl - inspect and control the restic backup on this machine.
+
+USAGE
+  sudo restic-ctl <command> [options]
+  restic-ctl help [<command>]        detail for one command
+
+  Everything except help needs root: the credentials under /etc/restic - the
+  config, the repository password, the SSH key - are root-only by design.
+
+READING  (fast - local files and repository metadata, no data transfer)
+  status              is a backup running now, how the last one went, what the
+                      timer thinks, how many recent runs failed
+  snapshots           what the repository holds: the list, the age of the newest,
+                      totals
+  history             table of recent runs, the failed ones included
+  log                 the tail of the backup log
+  config              this machine's effective settings and where they live
+  schedule            when the backup runs, stored intent vs installed timer
+
+ACTING
+  run                 start a backup THROUGH SYSTEMD, in the same context the
+                      timer uses, and follow it
+  check               verify the repository
+  schedule <spec>     change when it runs and reinstall the timer
+  forget <id>...      delete snapshots and prune, with a confirmation step
+  restore [<id>]      restore a snapshot into a directory
+  unlock              clear a stale repository lock
+
+PASSTHROUGH  (restic itself, with this machine's repository, password file and
+              sftp.command already filled in)
+  exec <args>...      any restic command
+  ls [<id>] [path]    list a snapshot's contents
+  find <pattern>      find a path across snapshots
+
+OPTIONS
+  --base DIR          where the configuration lives (default /etc/restic)
+  --deep              status, snapshots: add a structural check of the repository
+  --data              check: re-read actual data blobs
+  --subset FRACTION   check: how much data to re-read (default 1/12, implies
+                      --data); takes 1/12 or 5%
+  --count N           history, log: how many entries (default 15)
+  --follow            log: keep watching
+  --no-wait           run: start the service and return instead of following it
+  --yes               forget: skip the confirmation prompt
+  --target DIR        restore: where to restore to (required)
+  --retry SPEC        schedule: the second, same-day OnCalendar entry
+  -h, --help          this text
+
+  Anything not listed here is passed through to restic by exec, forget, restore,
+  ls and find, so their own options work unchanged: --dry-run, --long, --include.
+
+EXIT CODES
+  0  fine    1  a problem worth acting on    2  wrong usage
+USAGE_EOF
+}
+
+help_topic() {
+    case "${1:-}" in
+    status) cat <<'T_EOF'
+restic-ctl status - is the backup healthy right now.
+
+  sudo restic-ctl status [--deep]
+
+Reads local state only, so it is instant and safe to run during a backup:
+  State          idle, or running - and whether that comes from the systemd
+                 service, from a bare restic process, or is only a stale progress
+                 file (reported as "maybe")
+  Progress       when a backup is running: files and bytes done so far, from
+                 progress.json, which the backup script writes from restic --json.
+                 This is the only way to see progress from a timer-launched run:
+                 it has no terminal and therefore no progress bar.
+  Last run       result, when, how long, what changed
+  Timer          the unit's state, last result and next elapse
+  Recent failures  counted from history.jsonl, because a failed run leaves no
+                 trace in the repository at all
+  Credentials    that the key and the password file are root-owned and 600
+
+--deep also runs "restic check" (structure only, no data re-read). That contacts
+the NAS and takes a minute or two on a large repository.
+T_EOF
+        ;;
+    snapshots) cat <<'T_EOF'
+restic-ctl snapshots - what the repository actually holds.
+
+  sudo restic-ctl snapshots [--deep]
+
+The snapshot list with its tags and paths, the age of the newest one, and the
+repository totals from "restic stats". Metadata only: nothing file-sized is
+downloaded.
+
+Age is the number that matters. A repository can be perfectly healthy and
+useless because the newest snapshot is three weeks old - a timer that has been
+failing quietly looks exactly like this.
+
+--deep also runs "restic check" (structure only).
+T_EOF
+        ;;
+    run) cat <<'T_EOF'
+restic-ctl run - start a backup the way the timer starts it.
+
+  sudo restic-ctl run [--no-wait]
+
+Starts restic-backup.service, it does not run restic itself. That matters: the
+service runs with its own environment, its Nice and IOSchedulingClass, and under
+ConditionACPower=true. A backup you launch by hand can succeed while the
+timer-launched one fails, and then you have tested nothing.
+
+By default it follows the run: progress from progress.json, refreshed until the
+service finishes. Ctrl-C stops watching, not the backup - the unit keeps going.
+--no-wait starts it and returns immediately.
+
+If a backup is already running it refuses and points at "restic-ctl status".
+
+Note ConditionACPower: on battery the service will not start, and systemd
+records that as a skipped start, not a failure. That is deliberate.
+T_EOF
+        ;;
+    check) cat <<'T_EOF'
+restic-ctl check - verify the repository.
+
+  sudo restic-ctl check [--data] [--subset FRACTION]
+
+Three levels, increasing in cost:
+
+  (default)               structure: every index, tree and pack is referenced and
+                          reachable. Metadata only, no data downloaded. Minutes.
+  --data --subset 1/12    re-reads a twelfth of the data blobs and verifies their
+                          hashes. This is the one that catches actual corruption.
+                          Costs bandwidth, not disk: nothing is written locally.
+                          Twelve monthly runs cover the whole repository.
+  --data --subset 100%    re-reads everything. On this repository that is hundreds
+                          of gigabytes over SFTP.
+
+--subset implies --data. It takes either a fraction (1/12) or a percentage (5%).
+
+What check cannot tell you is whether a restore works. For that see
+"restic-ctl help restore" - and note that "exec dump" verifies a file end to end
+without needing any free disk space.
+T_EOF
+        ;;
+    schedule) cat <<'T_EOF'
+restic-ctl schedule - show or change when the backup runs.
+
+  sudo restic-ctl schedule                     show
+  sudo restic-ctl schedule <spec>              change the main OnCalendar entry
+  sudo restic-ctl schedule [<spec>] --retry <spec>
+
+With no argument it shows both sides and says whether they agree: the intent
+stored in config.json, and what restic-backup.timer actually has installed -
+both OnCalendar entries, Persistent, the next elapse and the last result.
+
+With an argument it writes config.json first, then reinstalls the unit by calling
+step 8 of the installed setup-restic-backup.sh, then re-reads both to confirm.
+The unit is written in one place on purpose; two pieces of code writing the same
+file is how they drift apart.
+
+SPEC is a systemd calendar expression, and "systemd-analyze calendar <spec>" is
+the way to check one before using it:
+
+  daily                    03:00? no - 00:00. systemd's "daily" means midnight
+  '*-*-* 03:30'            every day at 03:30
+  '*-*-* 03,15:30'         twice a day
+  Mon..Fri 20:00           weekdays only
+  03:30                    accepted as a shorthand for '*-*-* 03:30'
+
+There are two OnCalendar entries, not one. The second is the retry: if the first
+run was interrupted - a suspend, the machine on battery, the NAS unreachable -
+this one picks it up the same day instead of waiting until tomorrow. When the
+first run succeeded, the second is a fast incremental and costs almost nothing.
+--retry sets it.
+
+Not settable here, and deliberately: ConditionACPower=true (no backup on
+battery), Persistent=true (catch up after the machine was off) and
+RandomizedDelaySec=15m. Unlike the Windows task there is no kill-after-N-hours
+limit at all, so a long first backup cannot be cut short.
+
+Needs the installer present in the tools directory. If it is missing, the command
+prints the exact line to run instead.
+T_EOF
+        ;;
+    history) cat <<'T_EOF'
+restic-ctl history - the recent runs, including the ones that failed.
+
+  sudo restic-ctl history [--count N]
+
+Reads history.jsonl, appended by the backup script at the end of every run. This
+file exists because the repository has no record of a failed backup: if the run
+died, there is no snapshot, and "restic snapshots" shows nothing unusual.
+
+Columns: when it started, how long it took, the result, new and changed files,
+bytes added, and the snapshot id when there is one.
+
+--count defaults to 15.
+T_EOF
+        ;;
+    log) cat <<'T_EOF'
+restic-ctl log - the backup log.
+
+  sudo restic-ctl log [--count N] [--follow]
+
+The tail of /var/log/restic-backup.log, written by the backup script on every
+run. --follow keeps watching, for a backup in progress.
+
+For a running backup, "status" is usually the better view: the log records what
+happened at each stage, while progress.json carries the live counters. For what
+systemd itself thinks, "journalctl -u restic-backup.service" is the other half.
+T_EOF
+        ;;
+    config) cat <<'T_EOF'
+restic-ctl config - this machine's effective settings.
+
+  sudo restic-ctl config
+
+Where the configuration lives, the NAS account and port, the tools directory, the
+composed repository string, the SSH config, the backup paths, the retention
+policy, then every file the system uses with its size and age, then the active
+exclude patterns.
+
+The repository string is composed from hostAlias and repoPath every time it is
+needed, never stored. Two copies of the same string is one copy too many.
+
+To change any of it, edit config.json and then re-run the installer from step 3
+so the generated files follow. The exception is the schedule, which has its own
+command: "restic-ctl schedule".
+T_EOF
+        ;;
+    exec) cat <<'T_EOF'
+restic-ctl exec - any restic command, against this repository.
+
+  sudo restic-ctl exec <restic arguments>...
+
+The repository, the password file, the cache directory and the sftp.command are
+already set, so this is plain restic with the connection filled in.
+
+  sudo restic-ctl exec snapshots --json
+  sudo restic-ctl exec stats latest
+  sudo restic-ctl exec diff 4f2a9c1b b9dd1b6d
+  sudo restic-ctl exec dump latest /home/me/notes.txt > /dev/null
+
+That last one is worth knowing: dump streams a file out of the repository and
+verifies it end to end without writing anything to disk. It is how to prove a
+restore works on a machine with no room for one.
+
+No confirmation and no guard rails here - it is restic. Destructive commands have
+their own wrappers ("forget") for exactly that reason.
+T_EOF
+        ;;
+    forget) cat <<'T_EOF'
+restic-ctl forget - delete snapshots and reclaim the space.
+
+  sudo restic-ctl forget <snapshot-id>... [--dry-run] [--yes]
+
+Removes the named snapshots, then prunes. Pruning is what actually frees space on
+the NAS; forgetting alone only unlinks the snapshot.
+
+  sudo restic-ctl forget b9dd1b6d --dry-run    say what would go, change nothing
+  sudo restic-ctl forget b9dd1b6d              show it, then ask before doing it
+  sudo restic-ctl forget b9dd1b6d --yes        no prompt
+
+Always --dry-run first. Data shared with other snapshots is kept, so the space
+freed is often far less than the snapshot's apparent size - and occasionally far
+more than you expected.
+
+Note that the scheduled backup already applies the retention policy from
+config.json after every successful run. This command is for a specific snapshot
+you want gone now.
+T_EOF
+        ;;
+    restore) cat <<'T_EOF'
+restic-ctl restore - restore a snapshot into a directory.
+
+  sudo restic-ctl restore [<snapshot-id>] --target <dir>
+
+The snapshot id defaults to "latest". --target is required, must be empty or
+absent, and must not be inside a path that is itself being backed up.
+
+A full restore needs as much free space as the snapshot holds, which is why no
+machine here has had one verified yet. Three ways to verify without that space:
+
+  sudo restic-ctl exec dump latest /home/me/notes.txt > /dev/null
+      streams one file through and checks its hashes. Zero disk.
+  sudo restic-ctl restore latest --target /var/tmp/restore-test --include /home/me/Documents
+      a real restore of one subtree: a genuine end-to-end test at a size you can
+      afford.
+  sudo restic-ctl exec mount /mnt/restic
+      Linux only, and the best of the three: the whole repository appears as a
+      read-only filesystem, every snapshot browsable, nothing copied. Needs FUSE.
+      Ctrl-C to unmount.
+T_EOF
+        ;;
+    unlock) cat <<'T_EOF'
+restic-ctl unlock - clear a stale repository lock.
+
+  sudo restic-ctl unlock
+
+restic locks the repository while writing. A run killed mid-flight - a suspend, a
+hard power cut, an OOM kill - can leave that lock behind, and the next backup
+then fails with "repository is already locked".
+
+Only run this when no backup is actually running. Check with "restic-ctl status"
+first: removing the lock out from under a live run is how a repository gets
+damaged.
+T_EOF
+        ;;
+    ls) cat <<'T_EOF'
+restic-ctl ls - list what is inside a snapshot.
+
+  sudo restic-ctl ls [<snapshot-id>] [<path>] [restic options]
+
+Defaults to the latest snapshot. Useful for finding the exact spelling of a path
+to hand to restore or dump.
+
+  sudo restic-ctl ls latest
+  sudo restic-ctl ls latest /home/me/Documents
+  sudo restic-ctl ls b9dd1b6d --long
+T_EOF
+        ;;
+    find) cat <<'T_EOF'
+restic-ctl find - which snapshots contain a given path.
+
+  sudo restic-ctl find <pattern> [restic options]
+
+Searches every snapshot, so it is slower than ls. Patterns are globs; quote them
+so the shell does not expand them first.
+
+  sudo restic-ctl find 'notes.txt'
+  sudo restic-ctl find '*.kdbx'
+  sudo restic-ctl find '**/Documents/tax-2025*'
+
+The answer to "did that file ever get backed up, and when did it last change".
+T_EOF
+        ;;
+    '') usage ;;
+    *)
+        echo "No help topic '$1'." >&2
+        echo 'Topics: status snapshots run check schedule history log config exec forget restore unlock ls find' >&2
+        return 2 ;;
+    esac
+}
+
+CMD_GIVEN=0
 [ $# -gt 0 ] && case "$1" in
-    status|snapshots|run|check|history|log|config) CMD="$1"; shift ;;
-    exec|forget|restore|unlock|ls|find)            CMD="$1"; shift ;;
+    status|snapshots|run|check|schedule|history|log|config) CMD="$1"; CMD_GIVEN=1; shift ;;
+    exec|forget|restore|unlock|ls|find)                     CMD="$1"; CMD_GIVEN=1; shift ;;
+    help)      CMD='help'; CMD_GIVEN=1; shift ;;
     -h|--help) usage; exit 0 ;;
 esac
 
@@ -75,14 +428,29 @@ while [ $# -gt 0 ]; do
         --target)  TARGET="$2"; shift 2 ;;
         --count)   COUNT="$2"; shift 2 ;;
         --base)    BASE="$2"; shift 2 ;;
-        -h|--help) usage; exit 0 ;;
+        --retry)   RETRY="$2"; shift 2 ;;
+        -h|--help)
+            # "restic-ctl forget --help" should explain forget, not print the index.
+            if [ "$CMD_GIVEN" = 1 ] && [ "$CMD" != 'help' ]; then
+                help_topic "$CMD"
+            else
+                usage
+            fi
+            exit 0 ;;
         *)
             case "$CMD" in
-                exec|forget|restore|ls|find) REST="$REST $1"; shift ;;
+                exec|forget|restore|ls|find|help|schedule) REST="$REST $1"; shift ;;
                 *) echo "unknown option: $1" >&2; exit 2 ;;
             esac ;;
     esac
 done
+
+# Before the root check and before config.json is read, so it works on a machine that
+# has no backup configured and from an unprivileged shell.
+if [ "$CMD" = 'help' ]; then
+    help_topic "$(printf '%s' "$REST" | awk '{print $1}')" || exit 2
+    exit 0
+fi
 
 CONFIG="$BASE/config.json"
 LEGACY_ENV="$BASE/settings.env"
@@ -652,6 +1020,192 @@ cmd_config() {
     printf '\n'
 }
 
+# ============================================================= schedule
+
+# --on-calendar and --retry-calendar used to be options of setup-restic-backup.sh.
+# They were in the wrong place: changing when the backup runs meant re-running the
+# installer, and "--only 8 --on-calendar ..." rewrote the unit while config.json still
+# held the old value - drift of exactly the kind that made the NAS account revert on one
+# machine. So the knobs live here and the unit is still written by step 8 of the
+# installer: one writer for the file, one command to change it.
+
+schedule_intent()  { cfg schedule.onCalendar; }
+schedule_retry()   { cfg schedule.retryCalendar; }
+
+schedule_report() {
+    want="$(schedule_intent)"; want_retry="$(schedule_retry)"
+
+    head_ 'Stored intent (config.json)'
+    field 'OnCalendar' "${want:-(not recorded)}"
+    field 'Retry'      "${want_retry:-(not recorded)}"
+
+    head_ 'Installed timer'
+    if ! systemctl cat "$TIMER" >/dev/null 2>&1; then
+        fail "$TIMER is not installed"
+        info 'Run setup-restic-backup.sh --only 8 to install it.'
+        return
+    fi
+    have="$(grep '^OnCalendar=' /etc/systemd/system/restic-backup.timer 2>/dev/null |
+            sed 's/^OnCalendar=//')"
+    # Printed line by line rather than joined: a spec contains spaces, and squashing
+    # them together is how you end up unable to tell two entries apart.
+    if [ -n "$have" ]; then
+        i=1
+        printf '%s\n' "$have" | while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            field "OnCalendar $i" "$line"
+            i=$((i + 1))
+        done
+    else
+        field 'OnCalendar' '(none - the timer never fires)' "$C_ERR"
+    fi
+    field 'Persistent' "$(systemctl show -p Persistent --value "$TIMER" 2>/dev/null)"
+    field 'Enabled'    "$(systemctl is-enabled "$TIMER" 2>/dev/null) / $(systemctl is-active "$TIMER" 2>/dev/null)"
+    systemctl list-timers --all "$TIMER" --no-pager --no-legend 2>/dev/null |
+        sed 's/^/                    /' | head -3
+
+    printf '\n'
+    # The whole reason this report shows both sides.
+    diff_found=0
+    first_have="$(printf '%s\n' "$have" | sed -n '1p')"
+    scnd_have="$(printf '%s\n' "$have" | sed -n '2p')"
+    if [ -n "$want" ] && [ "$want" != "$first_have" ]; then
+        warn "OnCalendar: config.json says '$want', the timer says '$first_have'"
+        diff_found=1
+    fi
+    if [ -n "$want_retry" ] && [ "$want_retry" != "$scnd_have" ]; then
+        warn "retry: config.json says '$want_retry', the timer says '$scnd_have'"
+        diff_found=1
+    fi
+    if [ "$diff_found" = 0 ]; then
+        ok 'the stored intent and the installed timer agree'
+    else
+        info 'Re-run "restic-ctl schedule <spec>" to make the timer follow config.json.'
+    fi
+}
+
+cmd_schedule() {
+    new="${REST# }"
+    if [ -z "$new" ] && [ -z "$RETRY" ]; then
+        schedule_report
+        printf '\n'
+        info 'To change it:  restic-ctl schedule 03:30'
+        info "               restic-ctl schedule '*-*-* 03,15:30'"
+        info "               restic-ctl schedule --retry '*-*-* 19:17'"
+        printf '\n'
+        return
+    fi
+
+    want="$(schedule_intent)"; want_retry="$(schedule_retry)"
+    spec="${new:-$want}"
+    [ -n "$spec" ] || spec='daily'
+    retry="${RETRY:-$want_retry}"
+    [ -n "$retry" ] || retry='*-*-* 19:17'
+
+    # A bare HH:MM is the thing anyone types first, and systemd accepts it - but as
+    # a one-off today, not as a daily entry. Expanded rather than silently misread.
+    case "$spec" in
+        [0-9][0-9]:[0-9][0-9]|[0-9]:[0-9][0-9]) spec="*-*-* $spec" ;;
+    esac
+    case "$retry" in
+        [0-9][0-9]:[0-9][0-9]|[0-9]:[0-9][0-9]) retry="*-*-* $retry" ;;
+    esac
+
+    # Validated before anything is written. systemd-analyze is the authority on what
+    # is a legal calendar expression, and a bad one in the unit file means a timer
+    # that silently never fires.
+    for s in "$spec" "$retry"; do
+        if command -v systemd-analyze >/dev/null 2>&1; then
+            if ! systemd-analyze calendar "$s" >/dev/null 2>&1; then
+                printf '\n'
+                fail "systemd does not accept '$s' as a calendar expression"
+                info "Try:  systemd-analyze calendar '*-*-* 03:30'"
+                printf '\n'
+                exit 2
+            fi
+        fi
+    done
+
+    # The installer owns the unit. Finding it here rather than duplicating the
+    # heredoc means the two can never disagree.
+    # Two places, because a machine set up before this was fixed has "/usr/local/bin"
+    # stored in paths.tools - the PATH directory, not the tools directory - and an
+    # --update is what corrects it. Looking in the built-in default as well means the
+    # command works on such a machine instead of only explaining itself.
+    installer=''
+    for _t in "$(cfg paths.tools)" '/usr/local/lib/restic-backup'; do
+        [ -n "$_t" ] || continue
+        if [ -f "$_t/setup-restic-backup.sh" ]; then
+            installer="$_t/setup-restic-backup.sh"
+            break
+        fi
+    done
+    if [ -z "$installer" ]; then
+        tools="$(cfg paths.tools)"
+        [ -n "$tools" ] || tools='/usr/local/lib/restic-backup'
+        installer="$tools/setup-restic-backup.sh"
+    fi
+    if [ ! -f "$installer" ]; then
+        printf '\n'
+        fail "the installer is not where config.json says it is: $installer"
+        info 'Nothing has been changed. Either re-run the installer with --update so it'
+        info 'installs itself there, or apply the change by hand from your own copy:'
+        info '  sudo ./setup-restic-backup.sh --only 8'
+        printf '\n'
+        exit 1
+    fi
+
+    head_ 'Changing the schedule'
+    if [ -n "$want" ] && [ "$want" != "$spec" ]; then
+        field 'OnCalendar' "$want  ->  $spec"
+    else
+        field 'OnCalendar' "$spec"
+    fi
+    if [ -n "$want_retry" ] && [ "$want_retry" != "$retry" ]; then
+        field 'Retry' "$want_retry  ->  $retry"
+    else
+        field 'Retry' "$retry"
+    fi
+
+    SPEC="$spec" RETRY_SPEC="$retry" python3 -c '
+import json, os, sys
+p = sys.argv[1]
+with open(p) as f:
+    d = json.load(f)
+s = d.setdefault("schedule", {})
+s["onCalendar"] = os.environ["SPEC"]
+s["retryCalendar"] = os.environ["RETRY_SPEC"]
+import datetime
+d["updated"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+tmp = p + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2)
+    f.write("\n")
+os.replace(tmp, p)
+' "$CONFIG" || { fail 'could not update config.json'; exit 1; }
+    chmod 600 "$CONFIG"
+    ok 'config.json updated'
+
+    head_ 'Reinstalling the timer'
+    info "$installer --only 8"
+    printf '\n'
+    bash "$installer" --only 8 --base "$BASE"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        printf '\n'
+        fail "the installer exited $rc; config.json was updated but the timer may not have been"
+        info 'Fix whatever it reported, then run this command again.'
+        printf '\n'
+        exit 1
+    fi
+
+    # Re-read both sides from disk. A step that reported success without its effect
+    # being checked is the single most common bug in this whole system.
+    printf '\n'
+    schedule_report
+    printf '\n'
+}
+
 # ======================================================= restic passthrough
 
 # The point of these: never retype the repository, the password file and the
@@ -816,6 +1370,7 @@ case "$CMD" in
     snapshots) cmd_snapshots ;;
     run)       cmd_run ;;
     check)     cmd_check ;;
+    schedule)  cmd_schedule ;;
     history)   cmd_history ;;
     log)       cmd_log ;;
     config)    cmd_config ;;

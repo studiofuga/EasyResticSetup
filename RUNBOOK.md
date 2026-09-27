@@ -16,6 +16,12 @@ compromised client can reach only its own snapshots.
 Naming convention: the NAS account is `restic-<machine>`, derived from the client's
 hostname, so nothing has to be chosen per machine. The installers do this themselves.
 
+**Where to look for what.** This runbook answers "how do I do X" and records why things
+are the way they are. `COMMANDS.md` is the reference: every command of every script, both
+platforms, with each option and what it costs. In the shell, `restic-ctl help` gives the
+command index and `restic-ctl help <command>` the detail for one, and both installers take
+`-Help` / `--help`.
+
 ### `/home` vs `/homes` — read this before anything else
 
 An SFTP session for these accounts lands on Synology's **virtual root**, `/`, not
@@ -62,7 +68,7 @@ backup script and `restic-ctl`:
            "hostAlias": "nas-restic", "repoPath": "home/restic-repo" },
   "backupPaths": ["C:\\Users\\<user>"],
   "retention": { "daily": 14, "weekly": 8, "monthly": 12 },
-  "schedule": { "time": "13:00", "timeLimitHours": 20 },
+  "schedule": { "time": "13:00", "timeLimitHours": 20, "wakeToRun": false },
   "paths": { "base": "C:\\ProgramData\\restic", "tools": "C:\\Program Files\\restic-backup" }
 }
 ```
@@ -459,37 +465,102 @@ restic stats latest
 subset argument it re-downloads the whole repository. Worth doing occasionally
 over the LAN, not over a slow link.
 
-## Changing the schedule
+## Updating a machine to a new version of the scripts
 
-The scheduled time lives in two places that must agree: Task Scheduler (or the systemd
-timer), which actually fires it, and `config.json`, which records the intent. One
-command changes both:
+Distribution is a copy — a USB stick, a share, a checkout. No git is required on any
+machine. What each machine needs is the folder; the installer then puts the tools into
+place itself.
 
 ```powershell
-.\Setup-ResticBackup.ps1 -TaskTime 03:30 -Only 8
+.\Setup-ResticBackup.ps1 -Update
 ```
 ```bash
-sudo ./setup-restic-backup.sh --on-calendar '*-*-* 03:30' --only 8
+sudo ./setup-restic-backup.sh --update
 ```
 
-Step 8 re-registers the task with the new time and writes it back to `config.json`, then
-prints the next run. Nothing else is touched, and no other parameter has to be repeated —
-they come from the stored config.
+`-Update` is steps 2 to 9 — install the tools, regenerate what is generated, re-verify
+everything — with one guard in front. **No parameters:** the machine's own `config.json`
+supplies them.
 
-The same works for the execution time limit (`-TimeLimitHours`), for `-WakeToRun`, and on
-Linux for the same-day retry (`--retry-calendar`).
+### The guard, and why it exists
 
-**Do not change the time in taskschd.msc.** The GUI edit works until the next `-From 8`,
-which re-registers the task from `config.json` and silently puts it back. The config file
-is the source of truth; the task is a projection of it.
+Step 2 installs a copy of the installer onto the machine, which means every machine has
+two: the one you brought over and the one already installed. Since the installed one sits
+at a known path, it is the easy one to type — and running it would quietly reinstall the
+older version over your update. So each script carries a `SCRIPT_VERSION` stamp and
+compares itself with the installed copy:
 
-To check what is actually scheduled:
+| Verdict | What it means | What happens |
+|---|---|---|
+| no installed copy | first run on this machine | proceeds |
+| same version | nothing to do | proceeds |
+| running is newer | the normal update | proceeds, printing `old -> new` |
+| **running is older** | you ran the installed copy, or the stick is stale | **stops, exit 3** |
+| same version, different content | one of the two was edited | warns, proceeds |
+
+A hash is compared as well as the version, which is what catches the last row: a version
+I forgot to bump would otherwise hide a real difference.
+
+To go back to an older version deliberately, `-Force` / `--force`.
+
+### The order that works
+
+1. Copy the folder onto the machine, into a **working** directory — not into the tools
+   directory the installer manages.
+2. Windows: check `restic-ctl status` says `State idle` first. Updating during a backup
+   would rewrite the script under the running process.
+3. `-Update` / `--update`.
+4. Read two lines of the header: the NAS account must be this machine's, and `Config`
+   must say either `config.json` or `migrated from …`.
+5. If the machine predates a template change, `-Only 3 -ForceExcludes` and diff against
+   the `.bak`.
+
+## Changing the schedule
+
+The time lives in two places that must agree: the scheduler, which actually fires it, and
+`config.json`, which records the intent. One command changes both:
 
 ```powershell
+restic-ctl schedule 03:30
+```
+```bash
+sudo restic-ctl schedule '*-*-* 03:30'
+```
+
+It writes `config.json`, then calls step 8 of the installed installer to re-register, then
+re-reads both sides and tells you whether they now agree. With no argument it only reports:
+
+```
+restic-ctl schedule
+```
+
+Also settable, on Windows: `-TimeLimitHours 24` (Task Scheduler kills the run at that
+limit) and `-WakeToRun` / `-NoWakeToRun`. On Linux: `--retry '*-*-* 19:17'`, the second
+same-day `OnCalendar` entry. A bare `HH:MM` works on both; on Linux it is expanded to
+`*-*-* HH:MM`, because systemd would otherwise read it as a one-off today, and the
+expression is validated with `systemd-analyze calendar` before anything is written.
+
+**This used to be an installer parameter and no longer is.** `-TaskTime`,
+`-TimeLimitHours`, `-WakeToRun`, `--on-calendar` and `--retry-calendar` now stop with a
+message pointing here. Two reasons: re-running an installer to move a start time is the
+wrong shape, and `-Only 8 -TaskTime 03:30` changed the task while `config.json` still held
+the old value — so the next `-From 3` quietly put it back. The same drift as the
+parameters that used to revert, just narrower.
+
+**Do not change the time in taskschd.msc either.** The GUI edit survives until the next
+run of step 8, which re-registers from `config.json`. The config file is the source of
+truth; the task is a projection of it. `restic-ctl schedule` with no argument is what
+tells you the two have diverged.
+
+To see what is actually registered:
+
+```powershell
+restic-ctl schedule                    # both sides, and whether they agree
 restic-ctl status                      # scheduler section, with the next run
 Get-ScheduledTaskInfo restic-backup
 ```
 ```bash
+sudo restic-ctl schedule
 sudo restic-ctl status
 systemctl list-timers restic-backup.timer
 ```
@@ -642,5 +713,17 @@ Written and syntax-checked, but not yet exercised against the real NAS:
   fabricated `homes` tree, including under a POSIX shell for the busybox case
 - `--json` progress parsing on Windows: tested with simulated restic output, not
   with restic itself
+- the Power Request C# in the Windows backup script: it parses, and the log line
+  `(power request set)` has been seen on a real run, but `powercfg /requests` has not yet
+  corroborated it while a backup was running
+- `restic-ctl schedule`: the config.json round-trip, the time validation and the handoff
+  to step 8 were all tested for real, with a stub installer standing in for step 8 and
+  PowerShell 7 standing in for 5.1. What has **not** been exercised is the last link —
+  `Register-ScheduledTask` and `systemctl daemon-reload` actually taking the new value.
+  Run `restic-ctl schedule` with no argument afterwards: it reports both sides and says
+  whether they agree, which is exactly the check
+- no **restore** has been verified on any machine. This is the real gap, not a detail:
+  a backup that has never been restored from is a hypothesis. `restic-ctl help restore`
+  lists three ways to test one without needing free disk space
 
 Check each the first time you use it rather than assuming it works.

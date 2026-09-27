@@ -26,6 +26,12 @@
 # =============================================================================
 set -u
 
+# Bumped whenever this file changes. It exists so that --update can tell the copy you are
+# running from the copy already installed on the machine, and refuse to replace a newer
+# one with an older. A hash is compared too, because a version I forgot to bump would
+# otherwise hide a real difference.
+SCRIPT_VERSION='2026.09.27.2'
+
 # ---- defaults ---------------------------------------------------------------
 # No default on purpose: nothing site-specific is baked into this script. The NAS
 # address is asked for on a first run and stored in config.json, which is not in
@@ -52,32 +58,97 @@ SKIP_TIMER=0
 NAS_SETUP_ONLY=0
 FORCE_EXCLUDES=0
 ACCEPT_CHANGES=0
+UPDATE=0
+FORCE=0
 
 usage() {
-    sed -n '2,26p' "$0" | sed 's/^#//; s/^ //'
-    cat <<'EOF'
+    cat <<'USAGE_EOF'
+setup-restic-backup.sh - set up scheduled restic backups from this Linux machine to a
+Synology NAS over SFTP. Counterpart of Setup-ResticBackup.ps1: same nine steps, same
+layout, same config.json, and it generates the same NAS-side provisioning script.
 
-Options:
-  --nas-host HOST     NAS hostname or IP. No default: asked for on a first run,
-                      then read from config.json
-  --nas-user USER     Dedicated Synology user (default: restic-<hostname>)
-  --nas-port PORT     SSH port (default: 22)
-  --repo-path PATH    Repository path relative to the SFTP root
-                      (default: home/restic-repo -- "home" singular is DSM's
-                      alias for the account's own home; "homes" plural is the
-                      shared folder and needs a permission a backup-only
-                      account normally lacks)
-  --backup-paths "A B"  Paths to back up (default: "/home /etc")
-  --on-calendar SPEC  systemd OnCalendar value (default: daily)
-  --retry-calendar S  second, same-day attempt for an interrupted run
-  --from N            Start at step N
-  --only N            Run only step N
-  --skip-timer        Do not install the systemd units
-  --tools-dir DIR     Where this machine keeps its copy of the tools
-                      (default: /usr/local/lib/restic-backup)
-  --nas-setup         Only write the NAS provisioning script, then exit
-  -h, --help          This text
-EOF
+USAGE
+  sudo ./setup-restic-backup.sh [--nas-host HOST] [options]   first run
+  sudo ./setup-restic-backup.sh --update                      onto a new version
+  sudo ./setup-restic-backup.sh --only N                      re-run one step
+  ./setup-restic-backup.sh --help
+
+  Needs root. Re-running is safe: every step detects what is already in place and
+  skips or repairs it. After the first run no options are needed - they come from
+  /etc/restic/config.json.
+
+STEPS
+  1  Check prerequisites (root, restic, ssh, sftp, ssh-keygen, ssh-keyscan)
+  2  Create /etc/restic (root, 700) and install the tools into
+     /usr/local/lib/restic-backup, so a setup run from a checkout or a USB stick
+     does not leave the machine depending on it
+  3  Write config.json, ssh/config, excludes.txt, restic-backup.sh
+  4  Generate the SSH key, the repository password, and the NAS-side script
+  5  Trust the NAS host key (the fingerprint is shown for confirmation)
+  6  Verify authentication and write access   <-- the one manual gate
+  7  Initialise the restic repository
+  8  Install and enable restic-backup.service and restic-backup.timer
+  9  Print the summary and the first-backup commands
+
+  Step 6 stops until the public key is in the NAS user's authorized_keys. The script
+  prints exactly what to run on the NAS, then you re-run it to continue.
+
+WHAT TO PASS ON A FIRST RUN
+  --nas-host HOST     NAS hostname or IP. No default and nothing site-specific is
+                      baked in, so a first run asks if this is omitted. On a laptop
+                      prefer the Tailscale name, so the backup also works away from
+                      the LAN.
+  --nas-user USER     dedicated Synology account (default: restic-<hostname>)
+  --nas-port PORT     SSH port (default 22)
+  --repo-path PATH    repository path relative to the SFTP root
+                      (default home/restic-repo). "home" singular is DSM's alias for
+                      the account's own home and needs no share permission; "homes"
+                      plural is the shared folder and needs one a backup-only account
+                      normally lacks. This distinction cost an afternoon - do not
+                      change it without reason.
+  --backup-paths "A B"  what to back up (default: "/home /etc")
+  --host-alias NAME   the Host entry written into ssh/config and used in the
+                      repository string (default nas-restic)
+
+OPTIONS
+  --from N            start at step N
+  --only N            run just step N
+  --update            install the tools, regenerate the generated files and
+                      re-verify - the same as --from 2, plus a guard that refuses to
+                      replace an installed copy with an older one
+  --force             let --update install an older version on purpose
+  --force-excludes    step 3 leaves an existing excludes.txt alone, because it is
+                      meant to be tuned by hand. This replaces it with the current
+                      template, keeping the old one as excludes.txt.bak
+  --accept-changes    do not ask for confirmation when an option would change this
+                      machine's NAS identity
+  --skip-timer        do everything except installing the systemd units
+  --nas-setup         only write nas-provision-<user>.sh and print how to run it,
+                      then exit. Nothing local is changed
+  --base DIR          configuration directory (default /etc/restic)
+  --tools-dir DIR     tools directory (default /usr/local/lib/restic-backup)
+  -h, --help          this text
+
+MOVED TO restic-ctl
+  When the backup runs is no longer set here. --on-calendar and --retry-calendar
+  were retired: they are properties of a machine that is already set up, and
+  changing one should not mean re-running an installer.
+
+    sudo restic-ctl schedule                      show
+    sudo restic-ctl schedule '*-*-* 03:30'        change it
+    sudo restic-ctl schedule --retry '*-*-* 19:17'
+
+  restic-ctl writes config.json and then calls step 8 here, so the unit still has
+  exactly one writer. Passing a retired option says so and exits 2.
+
+AFTERWARDS
+  sudo restic-ctl status | snapshots | run | check | schedule
+  restic-ctl help
+
+EXIT CODES
+  0  done    1  a step failed    2  wrong usage or a missing answer
+  3  --update refused: the copy you ran is older than the installed one
+USAGE_EOF
 }
 
 # GIVEN records which options were typed, so a stored value can be told apart from a
@@ -90,14 +161,27 @@ while [ $# -gt 0 ]; do
         --nas-port)     NAS_PORT="$2";     GIVEN="$GIVEN nas-port";     shift 2 ;;
         --repo-path)    REPO_PATH="$2";    GIVEN="$GIVEN repo-path";    shift 2 ;;
         --backup-paths) BACKUP_PATHS="$2"; GIVEN="$GIVEN backup-paths"; shift 2 ;;
-        --on-calendar)  ON_CALENDAR="$2";  GIVEN="$GIVEN on-calendar";  shift 2 ;;
-        --retry-calendar) RETRY_CALENDAR="$2"; GIVEN="$GIVEN retry-calendar"; shift 2 ;;
+        --host-alias)   HOST_ALIAS="$2";   GIVEN="$GIVEN host-alias";   shift 2 ;;
+        # Retired rather than silently ignored: a parameter that is accepted and does
+        # nothing is worse than one that is gone. The schedule belongs to restic-ctl.
+        --on-calendar)
+            echo '--on-calendar is no longer an option of this script.' >&2
+            echo "Use:  sudo restic-ctl schedule '$2'" >&2
+            echo 'It writes config.json and reinstalls the timer through step 8 here,' >&2
+            echo 'so the two can never hold different values.' >&2
+            exit 2 ;;
+        --retry-calendar)
+            echo '--retry-calendar is no longer an option of this script.' >&2
+            echo "Use:  sudo restic-ctl schedule --retry '$2'" >&2
+            exit 2 ;;
         --from)         FROM="$2"; shift 2 ;;
         --only)         ONLY="$2"; shift 2 ;;
         --skip-timer)   SKIP_TIMER=1; shift ;;
         --nas-setup)    NAS_SETUP_ONLY=1; shift ;;
         --force-excludes) FORCE_EXCLUDES=1; shift ;;
         --accept-changes) ACCEPT_CHANGES=1; shift ;;
+        --update)       UPDATE=1; shift ;;
+        --force)        FORCE=1; shift ;;
         --base)         BASE="$2"; shift 2 ;;
         --tools-dir)    TOOLS_DIR="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
@@ -168,10 +252,13 @@ if [ -f "$CONFIG" ]; then
     given nas-user  || { v="$(cfg nas.user)";           [ -n "$v" ] && NAS_USER="$v"; }
     given nas-port  || { v="$(cfg nas.port)";           [ -n "$v" ] && NAS_PORT="$v"; }
     given repo-path || { v="$(cfg nas.repoPath)";       [ -n "$v" ] && REPO_PATH="$v"; }
-    v="$(cfg nas.hostAlias)";                           [ -n "$v" ] && HOST_ALIAS="$v"
+    given host-alias || { v="$(cfg nas.hostAlias)";     [ -n "$v" ] && HOST_ALIAS="$v"; }
     given backup-paths || { v="$(cfg backupPaths)";     [ -n "$v" ] && BACKUP_PATHS="$v"; }
-    given on-calendar    || { v="$(cfg schedule.onCalendar)";    [ -n "$v" ] && ON_CALENDAR="$v"; }
-    given retry-calendar || { v="$(cfg schedule.retryCalendar)"; [ -n "$v" ] && RETRY_CALENDAR="$v"; }
+    # The schedule has no command-line override any more: it is whatever config.json
+    # says, and "restic-ctl schedule" is what writes it.
+    v="$(cfg schedule.onCalendar)";    [ -n "$v" ] && ON_CALENDAR="$v"
+    v="$(cfg schedule.retryCalendar)"; [ -n "$v" ] && RETRY_CALENDAR="$v"
+
     v="$(cfg retention.daily)";   [ -n "$v" ] && KEEP_DAILY="$v"
     v="$(cfg retention.weekly)";  [ -n "$v" ] && KEEP_WEEKLY="$v"
     v="$(cfg retention.monthly)"; [ -n "$v" ] && KEEP_MONTHLY="$v"
@@ -393,6 +480,73 @@ show_nas_provision_instructions() {
 }
 
 # =============================================================================
+# Reads the version stamp out of another copy of this script. sed rather than running it:
+# executing an unknown copy to ask its version is not a trade worth making.
+stamped_version() {
+    [ -f "$1" ] || return 1
+    sed -n "s/^[[:space:]]*SCRIPT_VERSION='\\([^']*\\)'.*/\\1/p" "$1" | head -n 1
+}
+
+short_hash() {
+    [ -f "$1" ] || return 1
+    sha256sum "$1" 2>/dev/null | cut -c1-12
+}
+
+# Compares the running copy with the one installed on this machine. Step 2 copies the
+# running one over the installed one, so running the installed copy by mistake - the
+# obvious thing, since it sits at a known path - would quietly reinstall an older
+# version. Echoes one of: none same newer older diverged
+compare_installed() {
+    _inst="$TOOLS_DIR/setup-restic-backup.sh"
+    _run="$SCRIPT_DIR/$(basename "$0")"
+    [ "$_run" = "$_inst" ] && { echo same; return; }
+    [ -f "$_inst" ] || { echo none; return; }
+    _theirs="$(stamped_version "$_inst")"
+    [ -n "$_theirs" ] || { echo diverged; return; }
+    if [ "$_theirs" = "$SCRIPT_VERSION" ]; then
+        if [ "$(short_hash "$_inst")" = "$(short_hash "$_run")" ]; then echo same; else echo diverged; fi
+        return
+    fi
+    # Version sort puts the lower first; if that is the installed one, we are newer.
+    _lower="$(printf '%s\n%s\n' "$SCRIPT_VERSION" "$_theirs" | sort -V | head -n 1)"
+    if [ "$_lower" = "$_theirs" ]; then echo newer; else echo older; fi
+}
+
+assert_not_downgrade() {
+    _inst="$TOOLS_DIR/setup-restic-backup.sh"
+    _theirs="$(stamped_version "$_inst" 2>/dev/null || true)"
+    case "$(compare_installed)" in
+        none)  info 'no installed copy yet: this run installs one' ;;
+        same)  info "version $SCRIPT_VERSION, same as the installed copy" ;;
+        newer) ok "updating the installed copy: $_theirs -> $SCRIPT_VERSION" ;;
+        older)
+            printf '\n'
+            fail "this copy is OLDER than the one installed: $SCRIPT_VERSION vs $_theirs"
+            info "running   $SCRIPT_DIR/$(basename "$0")"
+            info "installed $_inst"
+            printf '\n'
+            info 'Continuing would reinstall the older version. Two likely causes: you ran the'
+            info 'installed copy instead of the one you just brought over, or the USB copy is'
+            info 'stale.'
+            printf '\n    %sRun the newer copy instead, or --force to go back on purpose.%s\n\n' \
+                "$C_WARN" "$C_OFF"
+            [ "$FORCE" = 1 ] || exit 3
+            warn 'downgrading anyway (--force)' ;;
+        *)
+            warn "same version $SCRIPT_VERSION but different content"
+            info 'One of the two was edited. Check which one you mean to keep.'
+            info "running   $SCRIPT_DIR/$(basename "$0")"
+            info "installed $_inst" ;;
+    esac
+}
+
+# --update is the ordinary way to bring a machine onto a new version of these scripts.
+# FROM is only defaulted to 2 when the caller did not choose a step themselves; --from 1
+# is indistinguishable from not passing it, and equivalent anyway.
+if [ "$UPDATE" = 1 ] && [ "$FROM" = 1 ] && [ "$ONLY" = 0 ]; then
+    FROM=2
+fi
+
 printf '\n=== restic backup setup ===\n'
 info "NAS          $NAS_USER@$NAS_HOST:$NAS_PORT"
 info "Repository   $REPOSITORY"
@@ -449,6 +603,11 @@ if [ -f "$CONFIG" ]; then
     fi
 fi
 
+if [ "$UPDATE" = 1 ]; then
+    step 0 'Update check'
+    assert_not_downgrade
+fi
+
 if [ "$NAS_SETUP_ONLY" -eq 1 ]; then
     step 0 'NAS provisioning script'
     show_nas_provision_instructions
@@ -499,6 +658,8 @@ if should_run 2; then
     # there, so once it was gone the machine could not be reconfigured or inspected.
     # Executables go on PATH (step 3 installs restic-ctl); the installer and the docs
     # go here. Credentials stay in $BASE, which is root-only: nothing secret is copied.
+    [ "$UPDATE" = 1 ] || assert_not_downgrade
+
     mkdir -p "$TOOLS_DIR"
     chmod 755 "$TOOLS_DIR"
     copied=''
@@ -548,7 +709,7 @@ print(json.dumps(sys.stdin.read().split()))')"
   "backupPaths": $BACKUP_PATHS_JSON,
   "retention": { "daily": $KEEP_DAILY, "weekly": $KEEP_WEEKLY, "monthly": $KEEP_MONTHLY },
   "schedule": { "onCalendar": "$ON_CALENDAR", "retryCalendar": "$RETRY_CALENDAR" },
-  "paths": { "base": "$BASE", "tools": "/usr/local/bin" }
+  "paths": { "base": "$BASE", "tools": "$TOOLS_DIR" }
 }
 EOF
     chmod 600 "$CONFIG"
@@ -702,6 +863,11 @@ EOF
 #   restic-backup.sh              normal run (what the systemd service does)
 #   restic-backup.sh --dry-run    list what would be backed up, no upload
 #   restic-backup.sh --init       one-time: create the repository
+#   restic-backup.sh --help       this text
+#
+# Prefer "restic-ctl run" over calling this by hand: it goes through systemd, so the
+# backup runs in the same context the timer uses - same Nice, same IOSchedulingClass,
+# same ConditionACPower. A run you start by hand can succeed where the timer's fails.
 set -u
 
 BASE='/etc/restic'
@@ -710,6 +876,24 @@ LOG='/var/log/restic-backup.log'
 PROGRESS="$BASE/progress.json"
 LAST_RUN="$BASE/last-run.json"
 HISTORY="$BASE/history.jsonl"
+
+# Before the config check: --help has to work on a machine where something is
+# missing, which is exactly when someone reaches for it.
+case "${1:-}" in
+    -h|--help)
+        sed -n '2,12p' "$0" | sed 's/^#//; s/^ //'
+        echo
+        echo "Reads everything from $CONFIG: paths, retention, the NAS alias."
+        echo 'Writes the log, progress.json, last-run.json and history.jsonl.'
+        echo
+        echo 'Generated by setup-restic-backup.sh - edits here are overwritten on the'
+        echo 'next --update. Change config.json, or the installer, instead.'
+        echo
+        echo 'Day to day use restic-ctl, not this script:'
+        echo '  sudo restic-ctl run | status | snapshots        restic-ctl help'
+        exit 0 ;;
+esac
+
 [ -r "$CONFIG" ] || { echo "missing $CONFIG - run setup-restic-backup.sh" >&2; exit 1; }
 
 cfg() {

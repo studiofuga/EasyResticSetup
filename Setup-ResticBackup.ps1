@@ -8,7 +8,8 @@
     what is already in place and skips or repairs it.
 
         1  Check prerequisites (admin rights, restic, ssh, ssh-keygen)
-        2  Create C:\ProgramData\restic and lock it down to SYSTEM + Administrators
+        2  Create C:\ProgramData\restic, lock it to SYSTEM + Administrators, and install
+           the tools into C:\Program Files\restic-backup
         3  Write config.json, ssh\config, excludes.txt, restic-backup.ps1
         4  Generate the dedicated SSH key and the repository password
         5  Trust the NAS host key (fingerprint shown for confirmation)
@@ -37,19 +38,60 @@
 .PARAMETER BackupPath
     One or more paths to back up. Defaults to the current user's profile folder.
 
+.PARAMETER Port
+    SSH port on the NAS. Default 22.
+
+.PARAMETER HostAlias
+    The Host entry written into ssh\config and used in the repository string.
+    Default nas-restic. Machines set up earlier may use another alias; it is read
+    back from config.json, so it never has to be retyped.
+
+.PARAMETER Base
+    Configuration directory. Default C:\ProgramData\restic.
+
+.PARAMETER ToolsDir
+    Where this machine keeps its own copy of the scripts, so a setup run from a USB
+    stick does not leave the machine depending on the stick.
+    Default C:\Program Files\restic-backup.
+
+.PARAMETER TaskName
+    Name of the scheduled task. Default restic-backup.
+
 .PARAMETER From
     Start at this step number (default 1).
 
 .PARAMETER Only
-    Run just this one step.
+    Run just this one step. This is how restic-ctl applies a schedule change: it
+    writes config.json, then calls -Only 8.
 
 .PARAMETER SkipTask
     Do everything except registering the scheduled task.
+
+.PARAMETER NoPath
+    Do not add the tools directory to the machine PATH.
+
+.PARAMETER AcceptChanges
+    Do not ask for confirmation when a parameter would change this machine's NAS
+    identity. Without it, a run that would repoint the machine at another account
+    stops and asks - the drift that once sent one machine's backup to another
+    machine's repository.
+
+.PARAMETER Help
+    Print the full usage, including every option and the steps, and exit.
 
 .PARAMETER NasSetup
     Only write the NAS-side provisioning script (nas-provision-<NasUser>.sh) next to
     this one and print how to run it, then exit. Nothing local is changed. Step 4
     generates the same file as part of a normal run.
+
+.PARAMETER Update
+    Bring this machine onto the version of the scripts you are running from: install the
+    tools, regenerate the generated files, re-verify. Equivalent to -From 2 with a guard
+    that refuses to replace an installed copy with an older one - the mistake that the
+    PATH shim makes easy, since the installed copy is the one you can type by name.
+
+.PARAMETER Force
+    Let -Update install an older version over a newer one, on purpose.
 
 .PARAMETER ForceExcludes
     Step 3 leaves an existing excludes.txt alone, because it is meant to be tuned by
@@ -66,6 +108,27 @@
 
 .EXAMPLE
     .\Setup-ResticBackup.ps1 -Only 6      # re-test the SSH key after fixing the NAS side
+
+.EXAMPLE
+    # Bring a machine onto a newer copy of the scripts, from a USB stick. Run the
+    # copy on the stick, not the installed one, or the guard stops you (exit 3).
+    .\Setup-ResticBackup.ps1 -Update
+
+.NOTES
+    The schedule is not set here. -TaskTime, -TimeLimitHours and -WakeToRun were
+    retired: they are properties of a machine already set up, and changing one should
+    not mean re-running an installer. Use restic-ctl instead:
+
+        restic-ctl schedule                     show
+        restic-ctl schedule 03:30               move the start time
+        restic-ctl schedule -TimeLimitHours 24
+        restic-ctl schedule -WakeToRun
+
+    It writes config.json and then calls step 8 here, so the task keeps exactly one
+    writer. Passing a retired parameter prints that and exits 2.
+
+    -Help prints the same reference as "restic-ctl help" does for the day-to-day
+    commands; COMMANDS.md documents both in full.
 #>
 [CmdletBinding()]
 param(
@@ -80,8 +143,6 @@ param(
     [string]   $ToolsDir    = 'C:\Program Files\restic-backup',
     [string]   $HostAlias   = 'nas-restic',
     [string]   $TaskName    = 'restic-backup',
-    [string]   $TaskTime    = '13:00',
-    [int]      $TimeLimitHours = 20,
     [int]      $From        = 1,
     [int]      $Only        = 0,
     [switch]   $SkipTask,
@@ -89,16 +150,158 @@ param(
     [switch]   $ForceExcludes,
     [switch]   $AcceptChanges,
     [switch]   $NoPath,
+    [switch]   $Update,
+    [switch]   $Force,
+    [switch]   $Help,
+
+    # Retired, and kept only so that passing one says where it went instead of
+    # "a parameter cannot be found". The schedule belongs to restic-ctl: changing a
+    # start time should not mean re-running an installer.
+    [string]   $TaskTime,
+    [int]      $TimeLimitHours = 0,
     [switch]   $WakeToRun
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Bumped whenever this file changes. It exists so that -Update can tell the copy you are
+# running from the copy already installed on the machine, and refuse to replace a newer
+# one with an older. A hash is compared too, because a version I forgot to bump would
+# otherwise hide a real difference.
+$ScriptVersion = '2026.09.27.2'
 
 # Which parameters the caller actually typed, as opposed to the ones that fell back
 # to a default. This is the whole basis of the configuration handling below: a
 # stored value must survive a re-run that does not mention it.
 $Given = @($PSBoundParameters.Keys)
 function Was-Given([string]$Name) { return $script:Given -contains $Name }
+
+# ------------------------------------------------------------------- help
+
+$UsageText = @'
+Setup-ResticBackup.ps1 - set up scheduled restic backups from this Windows machine
+to a Synology NAS over SFTP.
+
+USAGE
+  .\Setup-ResticBackup.ps1 [-NasHost <host>] [options]      first run
+  .\Setup-ResticBackup.ps1 -Update                          bring onto a new version
+  .\Setup-ResticBackup.ps1 -Only <n>                        re-run one step
+  .\Setup-ResticBackup.ps1 -Help
+
+  Needs an elevated shell. Re-running is safe: every step detects what is already
+  in place and skips or repairs it. After the first run no parameters are needed -
+  they come from C:\ProgramData\restic\config.json.
+
+STEPS
+  1  Check prerequisites (admin rights, restic, ssh, ssh-keygen)
+  2  Create C:\ProgramData\restic, lock it to SYSTEM + Administrators, and install
+     the tools into C:\Program Files\restic-backup so a copy run from a USB stick
+     does not leave the machine depending on the stick
+  3  Write config.json, ssh\config, excludes.txt, restic-backup.ps1
+  4  Generate the SSH key, the repository password, and the NAS-side script
+  5  Trust the NAS host key (the fingerprint is shown for confirmation)
+  6  Verify authentication and write access   <-- the one manual gate
+  7  Initialise the restic repository
+  8  Register the scheduled task, running as SYSTEM
+  9  Print the summary and the first-backup commands
+
+  Step 6 stops until the public key is in the NAS user's authorized_keys. The
+  script prints exactly what to run on the NAS, then you re-run it to continue.
+
+WHAT TO PASS ON A FIRST RUN
+  -NasHost <host>       NAS hostname or IP. No default and nothing site-specific
+                        is baked in, so a first run asks if this is omitted. On a
+                        laptop prefer the Tailscale name, so the backup also works
+                        away from the LAN.
+  -NasUser <user>       dedicated Synology account (default: restic-<hostname>)
+  -Port <n>             SSH port (default 22)
+  -RepoPath <path>      repository path relative to the SFTP root
+                        (default home/restic-repo). "home" singular is DSM's alias
+                        for the account's own home and needs no share permission;
+                        "homes" plural is the shared folder and needs one a
+                        backup-only account normally lacks. This distinction cost
+                        an afternoon - do not change it without reason.
+  -BackupPath <p>[,<p>] what to back up (default: the current user's profile)
+  -HostAlias <name>     the Host entry written into ssh\config (default nas-restic)
+
+OPTIONS
+  -From <n>             start at step n
+  -Only <n>             run just step n
+  -Update               install the tools, regenerate the generated files and
+                        re-verify - the same as -From 2, plus a guard that refuses
+                        to replace an installed copy with an older one
+  -Force                let -Update install an older version on purpose
+  -ForceExcludes        step 3 leaves an existing excludes.txt alone, because it is
+                        meant to be tuned by hand. This replaces it with the current
+                        template, keeping the old one as excludes.txt.bak
+  -AcceptChanges        do not ask for confirmation when a parameter would change
+                        this machine's NAS identity
+  -SkipTask             do everything except registering the scheduled task
+  -NoPath               do not add the tools directory to the machine PATH
+  -NasSetup             only write nas-provision-<NasUser>.sh and print how to run
+                        it, then exit. Nothing local is changed
+  -Base <dir>           configuration directory (default C:\ProgramData\restic)
+  -ToolsDir <dir>       tools directory (default C:\Program Files\restic-backup)
+  -TaskName <name>      scheduled task name (default restic-backup)
+  -Help                 this text
+
+MOVED TO restic-ctl
+  The start time, the execution time limit and the wake setting are no longer
+  parameters here. They are properties of a machine that is already set up, and
+  changing one should not mean re-running an installer:
+
+    restic-ctl schedule                    show
+    restic-ctl schedule 03:30              move the start time
+    restic-ctl schedule -TimeLimitHours 24
+    restic-ctl schedule -WakeToRun
+
+  restic-ctl writes config.json and then calls step 8 here, so the task still has
+  exactly one writer.
+
+AFTERWARDS
+  restic-ctl status | snapshots | run | check | schedule | help
+
+EXIT CODES
+  0  done    1  a step failed    2  wrong usage or a missing answer
+  3  -Update refused: the copy you ran is older than the installed one
+'@
+
+if ($Help) {
+    Write-Host ''
+    $UsageText -split "`n" | ForEach-Object {
+        if ($_.Trim()) { Write-Host "  $_" } else { Write-Host '' } }
+    Write-Host ''
+    exit 0
+}
+
+# The three schedule parameters were removed rather than deprecated in silence: a
+# parameter that is accepted and ignored is worse than one that is gone. Passing one
+# now says where it went. -Only 8 still reads the schedule from config.json, which is
+# how restic-ctl applies a change.
+$Retired = @()
+if (Was-Given 'TaskTime')       { $Retired += @('-TaskTime',       "restic-ctl schedule $TaskTime") }
+if (Was-Given 'TimeLimitHours') { $Retired += @('-TimeLimitHours', "restic-ctl schedule -TimeLimitHours $TimeLimitHours") }
+if (Was-Given 'WakeToRun')      { $Retired += @('-WakeToRun',      'restic-ctl schedule -WakeToRun') }
+if ($Retired.Count -gt 0) {
+    Write-Host ''
+    for ($i = 0; $i -lt $Retired.Count; $i += 2) {
+        Write-Host ("  $($Retired[$i]) is no longer a parameter of this script.") -ForegroundColor Red
+        Write-Host ("  Use:  $($Retired[$i + 1])") -ForegroundColor Yellow
+    }
+    Write-Host ''
+    Write-Host '  It writes config.json and re-registers the task through step 8 here,' -ForegroundColor DarkGray
+    Write-Host '  so the two can never hold different values.' -ForegroundColor DarkGray
+    Write-Host ''
+    exit 2
+}
+
+# First-install defaults for the schedule. They apply only when config.json has
+# nothing to say; after that config.json is the source, and restic-ctl the editor.
+# 20 hours, not 6: Task Scheduler KILLS the run at this limit, and a first backup with
+# no parent snapshot reads and hashes everything - 10h25m on a 1 TB profile here.
+$TaskTime       = '13:00'
+$TimeLimitHours = 20
+$WakeTask       = $false
 
 # Paths used throughout
 $SshDir       = Join-Path $Base 'ssh'
@@ -151,7 +354,7 @@ function Import-LegacySettings {
             weekly  = $old.Retention.Weekly
             monthly = $old.Retention.Monthly
         }
-        schedule = [pscustomobject]@{ time = $TaskTime; timeLimitHours = $TimeLimitHours }
+        schedule = [pscustomobject]@{ time = $TaskTime; timeLimitHours = $TimeLimitHours; wakeToRun = $WakeTask }
         _migrated = $true
     }
 }
@@ -174,9 +377,14 @@ if ($Stored) {
     if (-not (Was-Given 'HostAlias')      -and $Stored.nas.hostAlias)        { $HostAlias = $Stored.nas.hostAlias }
     if (-not (Was-Given 'RepoPath')       -and $Stored.nas.repoPath)         { $RepoPath  = $Stored.nas.repoPath }
     if (-not (Was-Given 'BackupPath')     -and $Stored.backupPaths)          { $BackupPath = @($Stored.backupPaths) }
-    if (-not (Was-Given 'TaskTime')       -and $Stored.schedule.time)        { $TaskTime = $Stored.schedule.time }
-    if (-not (Was-Given 'TimeLimitHours') -and $Stored.schedule.timeLimitHours) {
-        $TimeLimitHours = [int]$Stored.schedule.timeLimitHours
+    # The schedule has no command-line override at all any more, so it is simply
+    # whatever config.json says. restic-ctl schedule is what writes it.
+    if ($Stored.schedule) {
+        if ($Stored.schedule.time)           { $TaskTime       = "$($Stored.schedule.time)" }
+        if ($Stored.schedule.timeLimitHours) { $TimeLimitHours = [int]$Stored.schedule.timeLimitHours }
+        if ($Stored.schedule.PSObject.Properties['wakeToRun']) {
+            $WakeTask = [bool]$Stored.schedule.wakeToRun
+        }
     }
 }
 
@@ -462,7 +670,7 @@ echo 'Back on the client, continue with:  Setup-ResticBackup.ps1 -From 6'
 }
 
 # Step 8 owns the scheduled task, but config.json owns the intent. Without this, running
-# "-Only 8 -TaskTime 03:30" changed the task while config.json still said 13:00, and the
+# "-Only 8" with a schedule option changed the task while config.json still said 13:00, and the
 # next "-From 3" would quietly put the task back. Same drift as the parameters that used
 # to revert, just narrower.
 function Update-StoredSchedule {
@@ -473,7 +681,8 @@ function Update-StoredSchedule {
     }
     $sched = $cfg.schedule
     $changed = $false
-    foreach ($pair in @(@('time', $TaskTime), @('timeLimitHours', $TimeLimitHours))) {
+    foreach ($pair in @(@('time', $TaskTime), @('timeLimitHours', $TimeLimitHours),
+                        @('wakeToRun', $WakeTask))) {
         $name, $value = $pair
         if (-not $sched.PSObject.Properties[$name]) {
             $sched | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force
@@ -487,7 +696,87 @@ function Update-StoredSchedule {
     [System.IO.File]::WriteAllText($ConfigFile,
         (($cfg | ConvertTo-Json -Depth 5) + "`r`n"),
         (New-Object System.Text.UTF8Encoding($false)))
-    Write-Ok "config.json updated: schedule $TaskTime, time limit $TimeLimitHours h"
+    $wakeWord = 'no wake'
+    if ($WakeTask) { $wakeWord = 'wake to run' }
+    Write-Ok "config.json updated: schedule $TaskTime, time limit $TimeLimitHours h, $wakeWord"
+}
+
+# Reads the version stamp out of another copy of this script. Regex rather than running
+# it: executing an unknown copy to ask its version is not a trade worth making.
+function Get-StampedVersion([string]$Path) {
+    if (-not (Test-Path $Path)) { return $null }
+    $m = Select-String -Path $Path -Pattern "^\s*\`$ScriptVersion\s*=\s*'([^']+)'" |
+         Select-Object -First 1
+    if (-not $m) { return $null }
+    return $m.Matches[0].Groups[1].Value
+}
+
+function Get-ShortHash([string]$Path) {
+    if (-not (Test-Path $Path)) { return $null }
+    try { return (Get-FileHash -Path $Path -Algorithm SHA256).Hash.Substring(0, 12) } catch { return $null }
+}
+
+# Compares the running copy with the one installed on this machine. Step 2 copies the
+# running one over the installed one, so running the installed copy by mistake - the
+# obvious thing to do, since it is on PATH - would quietly reinstall an older version.
+# Verdicts: none, same, newer, older, diverged.
+function Compare-InstalledVersion {
+    $installed = Join-Path $ToolsDir 'Setup-ResticBackup.ps1'
+    $running   = $PSCommandPath
+    if (-not $running) { $running = Join-Path $PSScriptRoot 'Setup-ResticBackup.ps1' }
+
+    if ([IO.Path]::GetFullPath($running) -ieq [IO.Path]::GetFullPath($installed)) {
+        return [pscustomobject]@{ Verdict = 'same'; Installed = $ScriptVersion; Running = $ScriptVersion }
+    }
+    if (-not (Test-Path $installed)) {
+        return [pscustomobject]@{ Verdict = 'none'; Installed = $null; Running = $ScriptVersion }
+    }
+
+    $theirs = Get-StampedVersion $installed
+    $result = [pscustomobject]@{
+        Verdict = 'diverged'; Installed = $theirs; Running = $ScriptVersion
+        InstalledPath = $installed; RunningPath = $running
+    }
+    if (-not $theirs) { return $result }
+
+    if ($theirs -eq $ScriptVersion) {
+        $result.Verdict = if ((Get-ShortHash $installed) -eq (Get-ShortHash $running)) { 'same' } else { 'diverged' }
+        return $result
+    }
+    try {
+        $result.Verdict = if ([version]$ScriptVersion -gt [version]$theirs) { 'newer' } else { 'older' }
+    } catch { $result.Verdict = 'diverged' }
+    return $result
+}
+
+function Assert-NotDowngrade {
+    $c = Compare-InstalledVersion
+    switch ($c.Verdict) {
+        'none'  { Write-Info 'no installed copy yet: this run installs one'; return }
+        'same'  { Write-Info ("version {0}, same as the installed copy" -f $c.Running); return }
+        'newer' { Write-Ok ("updating the installed copy: {0} -> {1}" -f $c.Installed, $c.Running); return }
+        'older' {
+            Write-Host ''
+            Write-Fail ("this copy is OLDER than the one installed: {0} vs {1}" -f $c.Running, $c.Installed)
+            Write-Info "running   $($c.RunningPath)"
+            Write-Info "installed $($c.InstalledPath)"
+            Write-Host ''
+            Write-Info 'Continuing would reinstall the older version. Two likely causes: you ran'
+            Write-Info 'the copy on PATH instead of the one you just brought over, or the USB copy'
+            Write-Info 'is stale.'
+            Write-Host ''
+            Write-Host '    Run the newer copy instead, or -Force to go back on purpose.' -ForegroundColor Yellow
+            Write-Host ''
+            if (-not $Force) { exit 3 }
+            Write-Warn 'downgrading anyway (-Force)'
+        }
+        default {
+            Write-Warn ("same version {0} but different content" -f $c.Running)
+            Write-Info 'One of the two was edited. Check which one you mean to keep.'
+            Write-Info "running   $($c.RunningPath)"
+            Write-Info "installed $($c.InstalledPath)"
+        }
+    }
 }
 
 function Show-NasProvisionInstructions {
@@ -581,6 +870,16 @@ if ($Stored) {
     }
 }
 
+# -Update is the ordinary way to bring a machine onto a new version of these scripts:
+# install the tools, regenerate what is generated, then re-verify everything. It is
+# steps 2 to 9 with the downgrade guard in front, which is the part that is easy to
+# forget when the copy on PATH is the one you happen to type.
+if ($Update) {
+    if (-not (Was-Given 'From') -and -not (Was-Given 'Only')) { $From = 2 }
+    Write-Step 0 'Update check'
+    Assert-NotDowngrade
+}
+
 # Regenerate the NAS-side script and stop: nothing local is touched.
 if ($NasSetup) {
     Write-Step 0 'NAS provisioning script'
@@ -639,6 +938,8 @@ if (Should-Run 2) {
     # split follows the Windows convention: programs in Program Files, state and
     # credentials in ProgramData. Program Files keeps its inherited ACL - admins write,
     # users read - because nothing secret goes there.
+    if (-not $Update) { Assert-NotDowngrade }
+
     if (-not (Test-Path $ToolsDir)) {
         New-Item -ItemType Directory -Force -Path $ToolsDir | Out-Null
         Write-Ok "created $ToolsDir"
@@ -711,7 +1012,7 @@ if (Should-Run 3) {
         }
         backupPaths = @($BackupPath)
         retention   = [ordered]@{ daily = 14; weekly = 8; monthly = 12 }
-        schedule    = [ordered]@{ time = $TaskTime; timeLimitHours = $TimeLimitHours }
+        schedule    = [ordered]@{ time = $TaskTime; timeLimitHours = $TimeLimitHours; wakeToRun = $WakeTask }
         paths       = [ordered]@{ base = $Base; tools = $ToolsDir }
     }
     if ($Stored -and $Stored.retention) {
@@ -900,11 +1201,38 @@ target
     .\restic-backup.ps1            normal run (what the scheduled task does)
     .\restic-backup.ps1 -DryRun    list what would be backed up, no upload, no prune
     .\restic-backup.ps1 -Init      one-time: create the repository
+    .\restic-backup.ps1 -Help      this text
+
+  Prefer "restic-ctl run" over calling this by hand: it goes through the scheduler,
+  so the backup runs as SYSTEM in the same context the scheduled one does. A run
+  you start as yourself can succeed where the scheduled one fails.
 #>
 param(
     [switch]$Init,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Help
 )
+
+if ($Help) {
+    Write-Host ''
+    Write-Host '  restic-backup.ps1 - the scheduled backup itself.' -ForegroundColor White
+    Write-Host ''
+    Write-Host '    .\restic-backup.ps1            normal run (what the scheduled task does)'
+    Write-Host '    .\restic-backup.ps1 -DryRun    list what would be backed up, no upload, no prune'
+    Write-Host '    .\restic-backup.ps1 -Init      one-time: create the repository'
+    Write-Host ''
+    Write-Host '  Reads everything from config.json in this folder: paths, retention,'
+    Write-Host '  the NAS alias. Writes the log, progress.json, last-run.json and'
+    Write-Host '  history.jsonl beside it.'
+    Write-Host ''
+    Write-Host '  Generated by Setup-ResticBackup.ps1 - edits here are overwritten on the' -ForegroundColor DarkGray
+    Write-Host '  next -Update. Change config.json, or the installer, instead.' -ForegroundColor DarkGray
+    Write-Host ''
+    Write-Host '  Day to day use restic-ctl, not this script:' -ForegroundColor DarkGray
+    Write-Host '    restic-ctl run | status | snapshots | help' -ForegroundColor DarkGray
+    Write-Host ''
+    exit 0
+}
 
 $ErrorActionPreference = 'Continue'
 
@@ -1415,7 +1743,7 @@ if ((Should-Run 8) -and -not $SkipTask) {
     }
     # Opt-in: waking a laptop that is on battery only to skip the backup is pointless,
     # while on a desktop that sleeps it is exactly what you want.
-    if ($WakeToRun) { $settingsArgs['WakeToRun'] = $true }
+    if ($WakeTask) { $settingsArgs['WakeToRun'] = $true }
     $settings = New-ScheduledTaskSettingsSet @settingsArgs
 
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
@@ -1427,10 +1755,10 @@ if ((Should-Run 8) -and -not $SkipTask) {
     Write-Info "Time limit $TimeLimitHours h: Task Scheduler kills the run at that point."
     Write-Info 'On battery: does not start, and stops if the machine is unplugged.'
     Write-Info 'On failure: retries 3 times, 30 minutes apart, which covers a suspend.'
-    if ($WakeToRun) {
+    if ($WakeTask) {
         Write-Info 'WakeToRun: wakes the machine at the scheduled time.'
     } else {
-        Write-Info '-WakeToRun would wake a sleeping machine to run (off by default).'
+        Write-Info "Not waking the machine. 'restic-ctl schedule -WakeToRun' turns that on."
     }
     Update-StoredSchedule
     $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue

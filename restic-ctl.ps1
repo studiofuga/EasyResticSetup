@@ -11,9 +11,11 @@
       run         start a backup THROUGH THE SCHEDULER, in the same context the
                   scheduled run uses, and follow it
       check       verify repository integrity
+      schedule    show or change when the backup runs
       history     table of recent runs, including failed ones
       log         tail the backup log
       config      the effective settings of this machine
+      help        the command list, or the detail for one command
 
     And, as a wrapper over restic itself, so the repository, the password file
     and the sftp.command never have to be retyped:
@@ -28,9 +30,12 @@
     Fast by default: status, snapshots and history read local files and repository
     metadata only. -Deep adds a restic check; check -Data re-reads actual data.
 
-    Reads C:\ProgramData\restic\settings.psd1, so it needs no configuration of its
-    own. Most subcommands need an elevated shell, because the credentials are
-    readable by SYSTEM and Administrators only.
+    Reads C:\ProgramData\restic\config.json, so it needs no configuration of its
+    own. Every subcommand except help needs an elevated shell, because the
+    credentials are readable by SYSTEM and Administrators only.
+
+    "restic-ctl help <command>" prints the detail for one command: its arguments,
+    what it reads or changes, and what it costs to run.
 
 .EXAMPLE
     .\restic-ctl.ps1 status
@@ -53,12 +58,19 @@
 
 .EXAMPLE
     .\restic-ctl.ps1 exec stats latest
+
+.EXAMPLE
+    .\restic-ctl.ps1 schedule             # what time does it run, and what is registered
+    .\restic-ctl.ps1 schedule 03:30       # move it, and re-register the task
+
+.EXAMPLE
+    .\restic-ctl.ps1 help forget
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('status', 'snapshots', 'run', 'check', 'history', 'log', 'config',
-                 'exec', 'forget', 'restore', 'unlock', 'ls', 'find')]
+    [ValidateSet('status', 'snapshots', 'run', 'check', 'schedule', 'history', 'log',
+                 'config', 'exec', 'forget', 'restore', 'unlock', 'ls', 'find', 'help')]
     [string] $Command = 'status',
 
     [string] $Base   = 'C:\ProgramData\restic',
@@ -74,6 +86,15 @@ param(
     [switch] $Yes,           # forget: skip the confirmation prompt
     [string] $Target,        # restore: where to restore to
     [string] $TaskName = 'restic-backup',
+    [switch] $Help,          # same as the help command, so -Help works anywhere
+
+    # schedule: 0 means "leave whatever is stored alone". The three of them used to be
+    # parameters of Setup-ResticBackup.ps1, where they were the wrong shape: the
+    # installer installs, and re-running it to move a start time meant re-running steps
+    # that had nothing to do with the schedule.
+    [int]    $TimeLimitHours = 0,
+    [switch] $WakeToRun,
+    [switch] $NoWakeToRun,
 
     # Everything not bound above, passed through to restic. This is what makes
     # the wrapper subcommands work without re-declaring each restic option.
@@ -82,6 +103,372 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+$CtlVersion = '2026.09.27.2'
+
+# Which parameters were actually typed. "schedule -TimeLimitHours 0" has to be told
+# apart from "schedule" with the default still sitting there.
+$Given = @($PSBoundParameters.Keys)
+function Was-Given([string]$Name) { return $script:Given -contains $Name }
+
+# ------------------------------------------------------------------- help
+#
+# Handled before anything else, so "restic-ctl help" works on a machine that has no
+# config.json yet and from a shell that is not elevated. Everything below this point
+# needs both.
+
+$HelpOverview = @'
+restic-ctl - inspect and control the restic backup on this machine.
+
+USAGE
+  restic-ctl <command> [options]
+  restic-ctl help [<command>]        detail for one command
+
+  From cmd.exe or a shortcut, "restic-ctl" is the .cmd shim in
+  C:\Program Files\restic-backup. In PowerShell, ".\restic-ctl.ps1" works too.
+  Everything except help needs an elevated shell: the credentials under
+  C:\ProgramData\restic are readable by SYSTEM and Administrators only.
+
+READING  (fast - local files and repository metadata, no data transfer)
+  status              is a backup running now, how the last one went, what the
+                      scheduler thinks, how many recent runs failed
+  snapshots           what the repository holds: the list, the age of the newest,
+                      totals
+  history             table of recent runs, the failed ones included
+  log                 the tail of the backup log
+  config              this machine's effective settings and where they live
+  schedule            when the backup runs, stored intent vs registered task
+
+ACTING
+  run                 start a backup THROUGH THE SCHEDULER, in the same context
+                      the scheduled run uses, and follow it
+  check               verify the repository
+  schedule <time>     move the start time and re-register the task
+  forget <id>...      delete snapshots and prune, with a confirmation step
+  restore [<id>]      restore a snapshot into a folder
+  unlock              clear a stale repository lock
+
+PASSTHROUGH  (restic itself, with this machine's repository, password file and
+              sftp.command already filled in)
+  exec <args>...      any restic command
+  ls [<id>] [path]    list a snapshot's contents
+  find <pattern>      find a path across snapshots
+
+COMMON OPTIONS
+  -Base <dir>         where the configuration lives (default C:\ProgramData\restic)
+  -Help               this text
+
+  Per-command options are listed by "restic-ctl help <command>". The ones that
+  come up most:
+  -Deep               status, snapshots: add a structural check of the repository
+  -Data [-Subset f]   check: re-read actual data blobs, default 1/12 of them
+  -Count <n>          history, log: how many entries (default 15)
+  -Follow             log: keep watching
+  -NoWait             run: start the task and return instead of following it
+  -Yes                forget: skip the confirmation prompt
+  -Target <dir>       restore: where to restore to (required)
+
+EXIT CODES
+  0  fine    1  a problem worth acting on    2  wrong usage
+'@
+
+$HelpTopics = @{}
+
+$HelpTopics['status'] = @'
+restic-ctl status - is the backup healthy right now.
+
+  restic-ctl status [-Deep]
+
+Reads local state only, so it is instant and safe to run during a backup:
+  State          idle, or running - and whether that comes from the scheduled
+                 task, from a bare restic process, or is only a stale progress
+                 file (reported as "maybe")
+  Progress       when a backup is running: files and bytes done so far, from
+                 progress.json, which the backup script writes from restic --json.
+                 This is the only way to see progress from a scheduled run: it has
+                 no terminal and therefore no progress bar.
+  Last run       result, when, how long, what changed
+  Scheduler      the task's state, last result and next run time
+  Recent failures  counted from history.jsonl, because a failed run leaves no
+                 trace in the repository at all
+  Credentials    that the SSH key is owned by SYSTEM or Administrators and that
+                 nobody else has been granted access - the two independent causes
+                 of "UNPROTECTED PRIVATE KEY FILE"
+
+-Deep also runs "restic check" (structure only, no data re-read). That contacts
+the NAS and takes a minute or two on a large repository.
+'@
+
+$HelpTopics['snapshots'] = @'
+restic-ctl snapshots - what the repository actually holds.
+
+  restic-ctl snapshots [-Deep]
+
+The snapshot list with its tags and paths, the age of the newest one, and the
+repository totals from "restic stats". Metadata only: nothing file-sized is
+downloaded.
+
+Age is the number that matters. A repository can be perfectly healthy and
+useless because the newest snapshot is three weeks old - a scheduled task that
+has been failing quietly looks exactly like this.
+
+-Deep also runs "restic check" (structure only).
+'@
+
+$HelpTopics['run'] = @'
+restic-ctl run - start a backup the way the scheduler starts it.
+
+  restic-ctl run [-NoWait]
+
+Starts the scheduled task, it does not run restic itself. That matters: the task
+runs as SYSTEM, with the SYSTEM environment, the SYSTEM view of network drives
+and the credentials SYSTEM can read. A backup you launch by hand as yourself can
+succeed while the scheduled one fails, and then you have tested nothing.
+
+By default it follows the run: progress from progress.json, refreshed until the
+task finishes. Ctrl-C stops watching, not the backup - the task keeps going.
+-NoWait starts it and returns immediately.
+
+If a backup is already running it refuses and points at "restic-ctl status".
+'@
+
+$HelpTopics['check'] = @'
+restic-ctl check - verify the repository.
+
+  restic-ctl check [-Data] [-Subset <fraction>]
+
+Three levels, increasing in cost:
+
+  (default)               structure: every index, tree and pack is referenced and
+                          reachable. Metadata only, no data downloaded. Minutes.
+  -Data -Subset 1/12      re-reads a twelfth of the data blobs and verifies their
+                          hashes. This is the one that catches actual corruption.
+                          Costs bandwidth, not disk: nothing is written locally.
+                          Twelve monthly runs cover the whole repository.
+  -Data -Subset 100%      re-reads everything. On this repository that is hundreds
+                          of gigabytes over SFTP.
+
+-Subset implies -Data. It takes either a fraction (1/12) or a percentage (5%).
+
+What check cannot tell you is whether a restore works. For that, see
+"restic-ctl help restore" - and note that "exec dump" verifies a file end to end
+without needing any free disk space.
+'@
+
+$HelpTopics['schedule'] = @'
+restic-ctl schedule - show or change when the backup runs.
+
+  restic-ctl schedule                        show
+  restic-ctl schedule <HH:mm>                move the daily start time
+  restic-ctl schedule [<HH:mm>] -TimeLimitHours <n>
+  restic-ctl schedule [<HH:mm>] -WakeToRun | -NoWakeToRun
+
+With no argument it shows both sides and says whether they agree: the intent
+stored in config.json, and what Task Scheduler actually has registered - start
+time, time limit, wake setting, last result, next run.
+
+With an argument it writes config.json first, then re-registers the task by
+calling step 8 of the installed Setup-ResticBackup.ps1, then re-reads both to
+confirm. The registration lives in one place on purpose; two pieces of code
+writing the same task is how they drift apart.
+
+  -TimeLimitHours <n>   Task Scheduler KILLS the run at this limit. The default
+                        is 20. A first backup with no parent snapshot has to read
+                        and hash everything: on a 1 TB profile that took 10h25m,
+                        so the 6 hours that looked generous would have terminated
+                        it halfway.
+  -WakeToRun            wake the machine at the start time. Off by default:
+                        waking a laptop on battery only to skip the backup
+                        achieves nothing. On a desktop that sleeps, turn it on.
+  -NoWakeToRun          turn that back off.
+
+Not settable here, and deliberately: the task does not start on battery and
+stops if the machine is unplugged, and it retries three times 30 minutes apart.
+Those are the laptop-friendly defaults and the retry is what turns a backup
+interrupted by a suspend into a completed one.
+
+Needs the installer present in the tools directory. If it is missing, the
+command prints the exact line to run instead.
+'@
+
+$HelpTopics['history'] = @'
+restic-ctl history - the recent runs, including the ones that failed.
+
+  restic-ctl history [-Count <n>]
+
+Reads history.jsonl, appended by the backup script at the end of every run.
+This file exists because the repository has no record of a failed backup: if the
+run died, there is no snapshot, and "restic snapshots" shows nothing unusual.
+
+Columns: when it started, how long it took, the result, new and changed files,
+bytes added, and the snapshot id when there is one.
+
+-Count defaults to 15.
+'@
+
+$HelpTopics['log'] = @'
+restic-ctl log - the backup log.
+
+  restic-ctl log [-Count <n>] [-Follow]
+
+The tail of C:\ProgramData\restic\logs\restic-backup.log, written by the backup
+script on every run. -Follow keeps watching, for a backup in progress.
+
+For a running backup, "status" is usually the better view: the log records what
+happened at each stage, while progress.json carries the live counters.
+'@
+
+$HelpTopics['config'] = @'
+restic-ctl config - this machine's effective settings.
+
+  restic-ctl config
+
+Where the configuration lives, the NAS account and port, the tools directory,
+the composed repository string, the SSH config, the backup paths, the retention
+policy, then every file the system uses with its size and age, then the active
+exclude patterns.
+
+The repository string is composed from hostAlias and repoPath every time it is
+needed, never stored. Two copies of the same string is one copy too many.
+
+To change any of it, edit config.json and then re-run the installer from step 3
+so the generated files follow. The exception is the schedule, which has its own
+command: "restic-ctl schedule".
+'@
+
+$HelpTopics['exec'] = @'
+restic-ctl exec - any restic command, against this repository.
+
+  restic-ctl exec <restic arguments>...
+
+The repository, the password file, the cache directory and the sftp.command are
+already set, so this is plain restic with the connection filled in.
+
+  restic-ctl exec snapshots --json
+  restic-ctl exec stats latest
+  restic-ctl exec diff 4f2a9c1b b9dd1b6d
+  restic-ctl exec dump latest "C:/Users/me/notes.txt" > NUL
+
+That last one is worth knowing: dump streams a file out of the repository and
+verifies it end to end without writing anything to disk. It is how to prove a
+restore works on a machine with no room for one.
+
+No confirmation and no guard rails here - it is restic. Destructive commands
+have their own wrappers ("forget") for exactly that reason.
+'@
+
+$HelpTopics['forget'] = @'
+restic-ctl forget - delete snapshots and reclaim the space.
+
+  restic-ctl forget <snapshot-id>... [--dry-run] [-Yes]
+
+Removes the named snapshots, then prunes. Pruning is what actually frees space
+on the NAS; forgetting alone only unlinks the snapshot.
+
+  restic-ctl forget b9dd1b6d --dry-run     say what would go, change nothing
+  restic-ctl forget b9dd1b6d               show it, then ask before doing it
+  restic-ctl forget b9dd1b6d -Yes          no prompt
+
+Always --dry-run first. Data shared with other snapshots is kept, so the space
+freed is often far less than the snapshot's apparent size - and occasionally far
+more than you expected.
+
+Note that the scheduled backup already applies the retention policy from
+config.json after every successful run. This command is for a specific snapshot
+you want gone now.
+'@
+
+$HelpTopics['restore'] = @'
+restic-ctl restore - restore a snapshot into a folder.
+
+  restic-ctl restore [<snapshot-id>] -Target <folder>
+
+The snapshot id defaults to "latest". -Target is required, must be empty or
+absent, and must not be inside a path that is itself being backed up.
+
+A full restore needs as much free space as the snapshot holds, which is why no
+machine here has had one verified yet. Two ways to verify without that space:
+
+  restic-ctl exec dump latest "<path in the snapshot>" > NUL
+      streams one file through and checks its hashes. Zero disk.
+  restic-ctl restore latest -Target D:\restore-test --include "C:/Users/me/Documents"
+      a real restore of one subtree, which is a genuine end-to-end test at a
+      size you can afford.
+
+Paths inside a Windows snapshot keep their drive letter and use forward slashes:
+"C:/Users/me/Documents". Get them from "restic-ctl ls latest".
+'@
+
+$HelpTopics['unlock'] = @'
+restic-ctl unlock - clear a stale repository lock.
+
+  restic-ctl unlock
+
+restic locks the repository while writing. A run killed mid-flight - a suspend,
+a time limit, a hard power cut - can leave that lock behind, and the next backup
+then fails with "repository is already locked".
+
+Only run this when no backup is actually running. Check with "restic-ctl status"
+first: removing the lock out from under a live run is how a repository gets
+damaged.
+'@
+
+$HelpTopics['ls'] = @'
+restic-ctl ls - list what is inside a snapshot.
+
+  restic-ctl ls [<snapshot-id>] [<path>] [restic options]
+
+Defaults to the latest snapshot. Useful for finding the exact spelling of a path
+to hand to restore or dump.
+
+  restic-ctl ls latest
+  restic-ctl ls latest "C:/Users/me/Documents"
+  restic-ctl ls b9dd1b6d --long
+
+Paths inside a Windows snapshot keep the drive letter and use forward slashes.
+'@
+
+$HelpTopics['find'] = @'
+restic-ctl find - which snapshots contain a given path.
+
+  restic-ctl find <pattern> [restic options]
+
+Searches every snapshot, so it is slower than ls. Patterns are globs.
+
+  restic-ctl find "notes.txt"
+  restic-ctl find "*.kdbx"
+  restic-ctl find "**/Documents/tax-2025*"
+
+The answer to "did that file ever get backed up, and when did it last change".
+'@
+
+function Show-Help([string]$Topic) {
+    if (-not $Topic) {
+        Write-Host ''
+        $script:HelpOverview -split "`n" | ForEach-Object {
+            if ($_.Trim()) { Write-Host "  $_" } else { Write-Host '' } }
+        Write-Host ''
+        return
+    }
+    $key = $Topic.ToLower()
+    if ($script:HelpTopics.ContainsKey($key)) {
+        Write-Host ''
+        $script:HelpTopics[$key] -split "`n" | ForEach-Object {
+            if ($_.Trim()) { Write-Host "  $_" } else { Write-Host '' } }
+        Write-Host ''
+    } else {
+        Write-Host ''
+        Write-Host "  No help topic '$Topic'." -ForegroundColor Yellow
+        Write-Host ("  Topics: {0}" -f (($script:HelpTopics.Keys | Sort-Object) -join ', ')) -ForegroundColor DarkGray
+        Write-Host ''
+        exit 2
+    }
+}
+
+if ($Help -or $Command -eq 'help') {
+    Show-Help ($Rest | Select-Object -First 1)
+    exit 0
+}
 
 # ---------------------------------------------------------------- settings
 
@@ -775,6 +1162,252 @@ function Show-Config {
     Write-Host ''
 }
 
+# ========================================================== schedule
+
+# These three used to be parameters of Setup-ResticBackup.ps1. They were in the wrong
+# place: moving a start time meant re-running the installer, and "-Only 8 -TaskTime
+# 03:30" changed the task while config.json still held the old value - drift of exactly
+# the kind that made the NAS account revert on one machine.
+#
+# So the knobs live here, and the registration still lives in step 8 of the installer.
+# One writer for the task, one command to change it.
+
+function Get-ScheduleIntent {
+    # Built with plain assignments rather than "if" inside the hashtable literal:
+    # PowerShell 5.1 does not accept a statement as a hashtable value.
+    $s = $null
+    if ($Config.PSObject.Properties['schedule']) { $s = $Config.schedule }
+    $time = $null; $limit = $null; $wake = $false
+    if ($s) {
+        if ($s.PSObject.Properties['time'] -and $s.time) { $time = "$($s.time)" }
+        if ($s.PSObject.Properties['timeLimitHours'] -and $s.timeLimitHours) {
+            $limit = [int]$s.timeLimitHours
+        }
+        if ($s.PSObject.Properties['wakeToRun']) { $wake = [bool]$s.wakeToRun }
+    }
+    return [pscustomobject]@{ Time = $time; LimitHours = $limit; Wake = $wake }
+}
+
+function Get-ScheduleRegistered {
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) { return $null }
+    $time = $null
+    $trig = @($task.Triggers)[0]
+    if ($trig -and $trig.StartBoundary) {
+        try { $time = ([datetime]$trig.StartBoundary).ToString('HH:mm') } catch { $time = "$($trig.StartBoundary)" }
+    }
+    $limit = $null
+    if ($task.Settings.ExecutionTimeLimit) {
+        try {
+            $limit = [math]::Round(
+                ([System.Xml.XmlConvert]::ToTimeSpan($task.Settings.ExecutionTimeLimit)).TotalHours, 2)
+        } catch { $limit = $null }
+    }
+    $info = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue
+    $next = $null; $last = $null; $res = $null
+    if ($info) { $next = $info.NextRunTime; $last = $info.LastRunTime; $res = $info.LastTaskResult }
+    return [pscustomobject]@{
+        Time       = $time
+        LimitHours = $limit
+        Wake       = [bool]$task.Settings.WakeToRun
+        State      = "$($task.State)"
+        User       = $task.Principal.UserId
+        NextRun    = $next
+        LastRun    = $last
+        LastResult = $res
+    }
+}
+
+function Write-ScheduleReport {
+    $intent = Get-ScheduleIntent
+    $reg    = Get-ScheduleRegistered
+
+    Write-Head 'Stored intent (config.json)'
+    Write-Field 'Start time'  $(if ($intent.Time) { $intent.Time } else { '(not recorded)' })
+    Write-Field 'Time limit'  $(if ($intent.LimitHours) { "$($intent.LimitHours) h" } else { '(not recorded)' })
+    Write-Field 'Wake to run' $(if ($intent.Wake) { 'yes' } else { 'no' })
+
+    Write-Head 'Registered task'
+    if (-not $reg) {
+        Write-Fail "no scheduled task named '$TaskName'"
+        Write-Info 'Run Setup-ResticBackup.ps1 -Only 8 to register it.'
+        return
+    }
+    Write-Field 'Start time'  $(if ($reg.Time) { $reg.Time } else { '(none)' })
+    Write-Field 'Time limit'  $(if ($reg.LimitHours) { "$($reg.LimitHours) h" } else { '(none - the run is never killed)' })
+    Write-Field 'Wake to run' $(if ($reg.Wake) { 'yes' } else { 'no' })
+    Write-Field 'Runs as'     $reg.User
+    Write-Field 'State'       $reg.State
+    if ($reg.NextRun) { Write-Field 'Next run' ("{0:yyyy-MM-dd HH:mm}" -f $reg.NextRun) }
+    if ($reg.LastRun -and $reg.LastRun.Year -gt 1900) {
+        Write-Field 'Last run' ("{0:yyyy-MM-dd HH:mm}   result 0x{1:X}" -f $reg.LastRun, $reg.LastResult)
+    }
+
+    # The whole reason this report shows both sides.
+    $diff = @()
+    if ($intent.Time -and $reg.Time -and $intent.Time -ne $reg.Time) {
+        $diff += "start time: config.json says $($intent.Time), the task says $($reg.Time)"
+    }
+    if ($intent.LimitHours -and $reg.LimitHours -and
+        [math]::Abs($intent.LimitHours - $reg.LimitHours) -gt 0.01) {
+        $diff += "time limit: config.json says $($intent.LimitHours) h, the task says $($reg.LimitHours) h"
+    }
+    if ($intent.Wake -ne $reg.Wake) {
+        $diff += "wake to run: config.json says $($intent.Wake), the task says $($reg.Wake)"
+    }
+    Write-Host ''
+    if ($diff.Count -eq 0) {
+        Write-Ok 'the stored intent and the registered task agree'
+    } else {
+        Write-Warn 'the stored intent and the registered task disagree'
+        $diff | ForEach-Object { Write-Info $_ }
+        Write-Info 'Re-run "restic-ctl schedule <HH:mm>" to make the task follow config.json.'
+    }
+}
+
+function Set-StoredSchedule([string]$Time, [object]$LimitHours, [object]$Wake) {
+    $cfg = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+    if (-not $cfg.PSObject.Properties['schedule']) {
+        $cfg | Add-Member -NotePropertyName schedule -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $s = $cfg.schedule
+    foreach ($pair in @(@('time', $Time), @('timeLimitHours', $LimitHours), @('wakeToRun', $Wake))) {
+        $name, $value = $pair
+        if ($null -eq $value) { continue }
+        if ($s.PSObject.Properties[$name]) { $s.$name = $value }
+        else { $s | Add-Member -NotePropertyName $name -NotePropertyValue $value -Force }
+    }
+    if ($cfg.PSObject.Properties['updated']) {
+        $cfg.updated = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    }
+    [System.IO.File]::WriteAllText($ConfigFile,
+        (($cfg | ConvertTo-Json -Depth 6) + "`r`n"),
+        (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Invoke-Schedule {
+    # Any bare argument is the new start time. Options alone (-TimeLimitHours,
+    # -WakeToRun) are a change too, with the time left as it is.
+    $newTime = @($Rest | Where-Object { $_ -and -not $_.StartsWith('-') } | Select-Object -First 1)[0]
+    $changing = $newTime -or (Was-Given 'TimeLimitHours') -or
+                (Was-Given 'WakeToRun') -or (Was-Given 'NoWakeToRun')
+
+    if (-not $changing) {
+        Write-ScheduleReport
+        Write-Host ''
+        Write-Info 'To change it:  restic-ctl schedule 03:30'
+        Write-Info '               restic-ctl schedule -TimeLimitHours 24'
+        Write-Info '               restic-ctl schedule -WakeToRun | -NoWakeToRun'
+        Write-Host ''
+        return
+    }
+
+    if ($WakeToRun -and $NoWakeToRun) {
+        Write-Host ''
+        Write-Fail '-WakeToRun and -NoWakeToRun are opposites; pass one.'
+        Write-Host ''
+        exit 2
+    }
+
+    if ($newTime) {
+        # Validated here rather than left to New-ScheduledTaskTrigger, which accepts
+        # things like "3" and quietly means three in the morning of whatever date it
+        # parses. HH:mm only.
+        if ($newTime -notmatch '^([01]?\d|2[0-3]):[0-5]\d$') {
+            Write-Host ''
+            Write-Fail "not a time: '$newTime'"
+            Write-Info 'Expected HH:mm on a 24-hour clock, e.g. 03:30 or 22:05.'
+            Write-Host ''
+            exit 2
+        }
+        # Normalised, so config.json never holds both "3:30" and "03:30".
+        #
+        # Not [datetime]::ParseExact with an array of formats: PowerShell binds that to
+        # the single-format overload by flattening the array into "H:mm HH:mm", and then
+        # every input throws "was not recognized as a valid DateTime". Found by testing
+        # it, not by reading it. The regex above has already guaranteed the shape, so
+        # splitting is both correct and culture-independent.
+        $hm = $newTime -split ':'
+        $newTime = '{0:00}:{1:00}' -f [int]$hm[0], [int]$hm[1]
+    }
+
+    $intent = Get-ScheduleIntent
+    $time   = if ($newTime) { $newTime } elseif ($intent.Time) { $intent.Time } else { '13:00' }
+    $limit  = if (Was-Given 'TimeLimitHours') { $TimeLimitHours }
+              elseif ($intent.LimitHours) { $intent.LimitHours } else { 20 }
+    $wake   = if ($NoWakeToRun) { $false } elseif ($WakeToRun) { $true } else { $intent.Wake }
+
+    if ($limit -lt 1) {
+        Write-Host ''
+        Write-Fail "-TimeLimitHours $limit would have Task Scheduler kill the run immediately."
+        Write-Info 'Use 20 unless you have a reason; a first backup of a large profile took 10h25m.'
+        Write-Host ''
+        exit 2
+    }
+
+    # The installer owns the registration. Finding it here rather than duplicating
+    # 30 lines of Register-ScheduledTask means the two can never disagree.
+    # Two places, so a config.json with a stale paths.tools does not stop the command:
+    # what it says, then the built-in default.
+    $candidates = @()
+    if ($Config.paths -and $Config.paths.tools) { $candidates += $Config.paths.tools }
+    $candidates += 'C:\Program Files\restic-backup'
+    $installer = $null
+    foreach ($c in $candidates) {
+        $try = Join-Path $c 'Setup-ResticBackup.ps1'
+        if (Test-Path $try) { $installer = $try; break }
+    }
+    if (-not $installer) {
+        $installer = Join-Path $candidates[0] 'Setup-ResticBackup.ps1'
+        Write-Host ''
+        Write-Fail "the installer is not where config.json says it is: $installer"
+        Write-Info 'Nothing has been changed. Either re-run the installer with -Update so it'
+        Write-Info 'installs itself there, or apply the change by hand from your own copy:'
+        Write-Info "  .\Setup-ResticBackup.ps1 -Only 8"
+        Write-Host ''
+        exit 1
+    }
+
+    Write-Head 'Changing the schedule'
+    Write-Field 'Start time'  $(if ($intent.Time -and $intent.Time -ne $time) { "$($intent.Time)  ->  $time" } else { $time })
+    Write-Field 'Time limit'  $(if ($intent.LimitHours -and $intent.LimitHours -ne $limit) { "$($intent.LimitHours) h  ->  $limit h" } else { "$limit h" })
+    Write-Field 'Wake to run' $(if ($intent.Wake -ne $wake) { "$($intent.Wake)  ->  $wake" } else { "$wake" })
+
+    Set-StoredSchedule $time $limit $wake
+    Write-Ok 'config.json updated'
+
+    Write-Head 'Re-registering the task'
+    Write-Info "$installer -Only 8"
+    Write-Host ''
+    # Run as a child process rather than dot-sourcing: the installer has its own
+    # parameters, its own $Base and its own #Requires, and none of that should land in
+    # this scope. $ErrorActionPreference is lowered around it for the reason it is
+    # lowered around every native call in this system: with it at Stop, anything the
+    # child writes to stderr is turned into a terminating NativeCommandError, and the
+    # real message is lost behind it.
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer `
+            -Only 8 -Base $Base -TaskName $TaskName
+        $rc = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $previousEap }
+    if ($rc -ne 0) {
+        Write-Host ''
+        Write-Fail "the installer exited $rc; config.json was updated but the task may not have been"
+        Write-Info 'Fix whatever it reported, then run this command again.'
+        Write-Host ''
+        exit 1
+    }
+
+    # Re-read both sides from disk. A step that reported success without its effect
+    # being checked is the single most common bug in this whole system.
+    $script:Config = Get-Content $ConfigFile -Raw | ConvertFrom-Json
+    Write-Host ''
+    Write-ScheduleReport
+    Write-Host ''
+}
+
 # ======================================================= restic passthrough
 
 # The point of these: never retype the repository, the password file and the
@@ -943,6 +1576,7 @@ switch ($Command) {
     'snapshots' { Show-Snapshots }
     'run'       { Start-Run }
     'check'     { Show-Check }
+    'schedule'  { Invoke-Schedule }
     'history'   { Show-History }
     'log'       { Show-Log }
     'config'    { Show-Config }

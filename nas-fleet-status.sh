@@ -36,7 +36,18 @@ SHOW_SIZE=1
 
 usage() {
     cat <<EOF
+nas-fleet-status.sh - how fresh is every machine's backup, seen from the NAS.
+
 Usage: sudo sh nas-fleet-status.sh [options]
+
+  Runs ON THE NAS, as an admin account, over SSH. It finds every restic repository
+  under the per-user homes and reports the newest snapshot's age for each, so one
+  command answers "is anything not backing up" for the whole fleet.
+
+  It holds no repository passwords and needs none: the age of a snapshot is the
+  mtime of the newest file under the repository's snapshots/ directory, which is
+  readable without being able to decrypt anything. So this can be run from an
+  account that cannot read a single backed-up byte.
 
   --homes DIR      where the per-user homes live (default: $HOMES)
   --warn HOURS     warn above this snapshot age (default: $WARN_HOURS)
@@ -44,7 +55,11 @@ Usage: sudo sh nas-fleet-status.sh [options]
   --no-size        skip du, which is the slow part on a big repository
   -h, --help       this text
 
+  Defaults of 30 and 54 hours assume a daily backup: 30 h means one run has been
+  missed, 54 h means two.
+
 Exit code: 0 all machines fresh, 1 at least one stale, 2 nothing found.
+  The exit code is there so this can be the check behind a cron job or a monitor.
 EOF
 }
 
