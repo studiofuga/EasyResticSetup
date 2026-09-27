@@ -64,6 +64,10 @@ param(
     [string] $Base   = 'C:\ProgramData\restic',
     [switch] $Deep,          # status/snapshots: also run a structural check
     [switch] $Data,          # check: also re-read data blobs
+    # Fraction of the data blobs that -Data re-reads. 1/12 means twelve monthly runs
+    # cover the whole repository, which is how to get full verification on a link that
+    # cannot afford downloading everything at once.
+    [string] $Subset = '1/12',
     [int]    $Count  = 15,   # history/log: how many entries
     [switch] $Follow,        # log: keep watching
     [switch] $NoWait,        # run: start and return instead of following
@@ -504,13 +508,21 @@ function Show-Snapshots {
 
 # ================================================================ check
 
+# What this proves, and what it does not: "check" verifies the repository - the index
+# agrees with the pack files, nothing referenced is missing. "check -Data" additionally
+# re-reads a fraction of the packs and verifies their hashes, which is what catches bit
+# rot. Neither proves you can get your files back: for that see the dump technique below,
+# which needs no local disk space at all.
 function Invoke-Check([switch]$IncludeData) {
     # Not $args: that is an automatic variable in PowerShell.
     $checkArgs = @('check')
-    if ($IncludeData) { $checkArgs += @('--read-data-subset', '5%') }
+    if ($IncludeData) { $checkArgs += @('--read-data-subset', $Subset) }
     Write-Field 'Running' ("restic {0}" -f ($checkArgs -join ' ')) 'DarkGray'
     if ($IncludeData) {
-        Write-Cont 'This re-downloads 5% of the data blobs and can take a while.' 'DarkGray'
+        Write-Cont "Re-reads that fraction of the pack files. Nothing is written to disk -" 'DarkGray'
+        Write-Cont 'the data is streamed and discarded - but it is downloaded.' 'DarkGray'
+    } else {
+        Write-Cont 'Structure only: no data is downloaded, no disk space is used.' 'DarkGray'
     }
     $out = Invoke-Restic $checkArgs
     if ($LASTEXITCODE -eq 0) {
@@ -528,8 +540,14 @@ function Show-Check {
     Invoke-Check -IncludeData:$Data
     if (-not $Data) {
         Write-Host ''
-        Write-Host '  -Data also re-reads 5% of the data blobs (slower, catches bit rot).' -ForegroundColor DarkGray
+        Write-Host '  -Data re-reads a fraction of the blobs too (catches bit rot).' -ForegroundColor DarkGray
+        Write-Host "  -Subset '1/12' or -Subset '5%' sets that fraction; twelve monthly 1/12" -ForegroundColor DarkGray
+        Write-Host '  runs cover everything.' -ForegroundColor DarkGray
     }
+    Write-Host ''
+    Write-Host '  Neither check proves a restore works. With no disk space to spare:' -ForegroundColor White
+    Write-Host '    restic-ctl exec dump latest /etc/fstab'
+    Write-Host '    restic-ctl exec dump --archive tar latest / > NUL'
     Write-Host ''
 }
 

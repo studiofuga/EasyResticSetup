@@ -539,6 +539,81 @@ If the machine is a desktop that sleeps rather than a laptop, add `-WakeToRun` o
 Windows so the task wakes it at the scheduled time. It is off by default because
 waking a laptop on battery only to skip the backup is pointless.
 
+## Verifying a backup without the disk space for a restore
+
+A full restore is the most expensive test, not the best one. Three layers answer three
+different questions, and the two that matter most cost no local disk space at all.
+
+### 1. Is the repository intact? — free
+
+```bash
+sudo restic-ctl check
+```
+
+Verifies that the index agrees with the pack files and that nothing referenced is
+missing. Downloads nothing, writes nothing.
+
+### 2. Are the stored bytes still good? — costs bandwidth, not disk
+
+```bash
+sudo restic-ctl check --data              # default fraction: 1/12
+sudo restic-ctl check --subset 1/6
+```
+
+Re-reads that fraction of the pack files and verifies their hashes, which is what
+catches bit rot. The data is streamed and discarded, so nothing lands on disk. `1/12`
+monthly covers the whole repository over a year — the way to get complete verification
+on a link or a schedule that cannot afford downloading everything at once.
+
+### 3. Can you actually get a file back? — free, and this is the real question
+
+Neither check above proves a restore works. `dump` writes to stdout, so it verifies the
+whole path — open, decrypt, reassemble — using no disk:
+
+```bash
+# one file, byte-exact against the live copy
+sudo restic-ctl exec dump latest /etc/fstab | diff - /etc/fstab && echo identical
+
+# an entire subtree, reconstructed and thrown away
+sudo restic-ctl exec dump --archive tar latest /etc | tar -t > /dev/null
+
+# the entire snapshot: full data verification, zero disk, full download
+sudo restic-ctl exec dump --archive tar latest / > /dev/null
+```
+
+The last one is the strongest verification available without space: every blob is
+fetched, decrypted and reassembled into a real tar stream. If it completes, the snapshot
+is restorable.
+
+On Linux there is a better tool still, which also costs nothing:
+
+```bash
+sudo restic mount /mnt/restic
+ls /mnt/restic/snapshots/latest/
+diff -r /mnt/restic/snapshots/latest/etc /etc     # compare whatever you like
+sudo umount /mnt/restic
+```
+
+A read-only FUSE view of every snapshot. Ideal for spot-checking many files, and for
+answering "was this file in the backup a week ago". Needs FUSE, so Linux only — Windows
+would need WinFsp.
+
+### 4. A real restore — the only test of permissions and ownership
+
+Worth doing once per machine even on a small subset, because `dump` does not exercise
+how files land on disk:
+
+```bash
+sudo restic-ctl restore latest --target /var/tmp/restore-test --include /etc
+```
+
+`--include` keeps it to a few hundred MB. If even that will not fit, restore a single
+directory, or point `--target` at an external disk.
+
+**What to do routinely:** `check` often, `check --data --subset 1/12` monthly, and a
+`dump --archive tar latest / > /dev/null` when a machine's backup has changed shape —
+after a big exclude change, a repository move, or a restic upgrade.
+
 ## Reclaiming space after widening the exclusions
 
 Tightening `excludes.txt` does not shrink snapshots that already exist. Their

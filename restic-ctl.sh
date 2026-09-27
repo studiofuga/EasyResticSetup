@@ -49,6 +49,10 @@ CMD='status'
 YES=0
 TARGET=''
 REST=''
+# Fraction of the data blobs that "check --data" re-reads. 1/12 means twelve monthly
+# runs cover the whole repository, which is how to get full verification on a link that
+# cannot afford downloading everything at once.
+SUBSET='1/12'
 
 usage() { sed -n '3,26p' "$0" | sed 's/^#//; s/^ //'; }
 
@@ -64,6 +68,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --deep)    DEEP=1; shift ;;
         --data)    DATA=1; shift ;;
+        --subset)  SUBSET="$2"; DATA=1; shift 2 ;;
         --follow)  FOLLOW=1; shift ;;
         --no-wait) NOWAIT=1; shift ;;
         --yes)     YES=1; shift ;;
@@ -402,13 +407,20 @@ cmd_snapshots() {
 
 # ================================================================ check
 
+# What this proves, and what it does not: "check" verifies the repository - the index
+# agrees with the pack files, nothing referenced is missing. "check --data" additionally
+# re-reads a fraction of the packs and verifies their hashes, which is what catches bit
+# rot. Neither proves you can get your files back: for that see the dump and mount
+# techniques the RUNBOOK describes, both of which need no local disk space.
 do_check() {
     if [ "${1:-0}" = 1 ]; then
-        field 'Running' 'restic check --read-data-subset 5%' "$C_DIM"
-        cont 'This re-downloads 5% of the data blobs and can take a while.' "$C_DIM"
-        out="$(restic_ check --read-data-subset 5%)"
+        field 'Running' "restic check --read-data-subset $SUBSET" "$C_DIM"
+        cont "Re-reads that fraction of the pack files. Nothing is written to disk -" "$C_DIM"
+        cont "the data is streamed and discarded - but it is downloaded." "$C_DIM"
+        out="$(restic_ check --read-data-subset "$SUBSET")"
     else
         field 'Running' 'restic check' "$C_DIM"
+        cont 'Structure only: no data is downloaded, no disk space is used.' "$C_DIM"
         out="$(restic_ check)"
     fi
     if [ $? -eq 0 ]; then
@@ -424,9 +436,15 @@ cmd_check() {
     field 'Repository' "$RESTIC_REPOSITORY"
     head_ 'Integrity'
     do_check "$DATA"
-    [ "$DATA" = 1 ] || \
-        printf '\n  %s--data also re-reads 5%% of the data blobs (slower, catches bit rot).%s\n' \
-            "$C_DIM" "$C_OFF"
+    if [ "$DATA" = 0 ]; then
+        printf '\n  %s--data re-reads a fraction of the blobs too (catches bit rot).%s\n' "$C_DIM" "$C_OFF"
+        printf '  %s--subset 1/12 or --subset 5%% sets that fraction; twelve monthly 1/12 runs%s\n' "$C_DIM" "$C_OFF"
+        printf '  %scover everything.%s\n' "$C_DIM" "$C_OFF"
+    fi
+    printf '\n  %sNeither check proves a restore works. With no disk space to spare:%s\n' "$C_W" "$C_OFF"
+    printf '    restic-ctl exec dump latest /etc/fstab | diff - /etc/fstab\n'
+    printf '    restic-ctl exec dump --archive tar latest / > /dev/null\n'
+    printf '    sudo restic mount /mnt/restic     # then compare whatever you like\n'
     printf '\n'
 }
 
