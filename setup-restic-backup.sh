@@ -7,7 +7,7 @@
 #  layout, and it generates the same NAS-side provisioning script.
 #
 #      1  Check prerequisites (root, restic, ssh, sftp, ssh-keygen, ssh-keyscan)
-#      2  Create /etc/restic, owned by root, mode 700
+#      2  Create /etc/restic (root, 700) and install the tools on this machine
 #      3  Write config.json, ssh_config, excludes.txt, restic-backup.sh
 #      4  Generate the SSH key, the repository password, the NAS script
 #      5  Trust the NAS host key (fingerprint shown for confirmation)
@@ -36,6 +36,9 @@ NAS_PORT=22
 REPO_PATH=''                      # default: homes/<NAS_USER>/restic-repo
 HOST_ALIAS='nas-restic'
 BASE='/etc/restic'
+# Where the machine keeps its own copy of the tools, so one set up from a checkout or a
+# USB stick keeps working once that is gone. Mirrors C:\Program Files\restic-backup.
+TOOLS_DIR='/usr/local/lib/restic-backup'
 BACKUP_PATHS='/home /etc'
 KEEP_DAILY=14
 KEEP_WEEKLY=8
@@ -70,6 +73,8 @@ Options:
   --from N            Start at step N
   --only N            Run only step N
   --skip-timer        Do not install the systemd units
+  --tools-dir DIR     Where this machine keeps its copy of the tools
+                      (default: /usr/local/lib/restic-backup)
   --nas-setup         Only write the NAS provisioning script, then exit
   -h, --help          This text
 EOF
@@ -94,6 +99,7 @@ while [ $# -gt 0 ]; do
         --force-excludes) FORCE_EXCLUDES=1; shift ;;
         --accept-changes) ACCEPT_CHANGES=1; shift ;;
         --base)         BASE="$2"; shift 2 ;;
+        --tools-dir)    TOOLS_DIR="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
         *)              echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -355,6 +361,25 @@ PROVISION_BODY
 show_nas_provision_instructions() {
     write_nas_provision_script || return 0
     name="$(basename "$NAS_PROVISION")"
+
+    # Each of these files carries ONE machine's public key and names ONE NAS account.
+    # Running another machine's authorizes that machine on its own account and does
+    # nothing here, while the failure looks identical - which has happened twice. So if
+    # a stranger is sitting next to us, say so before printing the instructions.
+    others=''
+    for f in "$SCRIPT_DIR"/nas-provision-*.sh; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$NAS_PROVISION" ] && continue
+        others="$others $(basename "$f")"
+    done
+    if [ -n "$others" ]; then
+        printf '\n'
+        warn "Other machines' provisioning scripts are in this folder:"
+        for o in $others; do printf '            %s\n' "$o"; done
+        info "Run only $name. Another machine's script authorizes that machine"
+        info 'on its own NAS account and changes nothing here, while this step keeps'
+        info 'failing with the same "did not accept the key".'
+    fi
     printf '\n'
     printf '    %sEverything the NAS needs is in this generated script:%s\n' "$C_WARN" "$C_OFF"
     printf '      %s\n\n' "$NAS_PROVISION"
@@ -372,6 +397,7 @@ printf '\n=== restic backup setup ===\n'
 info "NAS          $NAS_USER@$NAS_HOST:$NAS_PORT"
 info "Repository   $REPOSITORY"
 info "Local base   $BASE"
+info "Tools        $TOOLS_DIR"
 info "Backup paths $BACKUP_PATHS"
 
 if [ -n "$MIGRATED_FROM" ]; then
@@ -460,13 +486,39 @@ fi
 
 # ============================================================== 2. directories
 if should_run 2; then
-    step 2 'Directory layout and permissions'
+    step 2 'Directory layout, permissions and tools'
     for d in "$BASE" "$SSH_DIR" "$BASE/cache"; do
         if [ -d "$d" ]; then info "exists $d"; else mkdir -p "$d" && ok "created $d"; fi
     done
     chown -R root:root "$BASE"
     chmod 700 "$BASE" "$SSH_DIR" "$BASE/cache"
     ok 'owned by root, mode 700 (the backup runs as root)'
+
+    # --- the machine gets its own copy of the tools ------------------------------
+    # Running the installer from a checkout or a USB stick used to leave everything
+    # there, so once it was gone the machine could not be reconfigured or inspected.
+    # Executables go on PATH (step 3 installs restic-ctl); the installer and the docs
+    # go here. Credentials stay in $BASE, which is root-only: nothing secret is copied.
+    mkdir -p "$TOOLS_DIR"
+    chmod 755 "$TOOLS_DIR"
+    copied=''
+    for name in setup-restic-backup.sh restic-ctl.sh nas-fleet-status.sh \
+                RUNBOOK.md README.md Setup-ResticBackup.ps1 restic-ctl.ps1; do
+        src="$SCRIPT_DIR/$name"
+        [ -f "$src" ] || continue
+        # Skip when already running from the destination, which would copy onto itself.
+        [ "$src" = "$TOOLS_DIR/$name" ] && continue
+        install -m 644 "$src" "$TOOLS_DIR/$name"
+        copied="$copied $name"
+    done
+    for x in setup-restic-backup.sh restic-ctl.sh nas-fleet-status.sh; do
+        [ -f "$TOOLS_DIR/$x" ] && chmod 755 "$TOOLS_DIR/$x"
+    done
+    if [ -n "$copied" ]; then
+        ok "installed to $TOOLS_DIR:$copied"
+    else
+        info 'tools already in place (running from the installed copy)'
+    fi
 fi
 
 # =========================================================== 3. configuration
@@ -892,8 +944,12 @@ BACKUP_SCRIPT_EOF
 
     # restic-ctl needs no configuration of its own - it reads config.json - so it is
     # simply put on PATH when it is shipped alongside this installer.
+    # 755, not 700: the script holds no secrets - it is the same file that sits in version
+    # control - and what actually gates it is the credentials, which are root-only in
+    # $BASE. Leaving it readable lets a non-root caller reach the script's own "run me with
+    # sudo" message instead of a bare Permission denied from the shell.
     if [ -f "$SCRIPT_DIR/restic-ctl.sh" ]; then
-        install -m 700 "$SCRIPT_DIR/restic-ctl.sh" /usr/local/bin/restic-ctl
+        install -m 755 "$SCRIPT_DIR/restic-ctl.sh" /usr/local/bin/restic-ctl
         ok '/usr/local/bin/restic-ctl'
     else
         info 'restic-ctl.sh not found next to this script, skipping its install'

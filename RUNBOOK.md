@@ -38,12 +38,14 @@ get the `home/restic-repo` default.
 
 | | Windows | Linux |
 |---|---------|-------|
-| Tools | `C:\Program Files\restic-backup` (on PATH via `restic-ctl.cmd`) | `/usr/local/bin` |
+| Executables | `C:\Program Files\restic-backup` (on PATH via `restic-ctl.cmd`) | `/usr/local/bin/restic-ctl`, `/usr/local/bin/restic-backup.sh` |
+| Installer and docs | same folder | `/usr/local/lib/restic-backup` |
 | Config, credentials, state | `C:\ProgramData\restic` | `/etc/restic` |
 | Machine config | `config.json` | `config.json` |
 
-The installer copies itself and `restic-ctl` into the tools folder, so a machine set
-up from a USB stick keeps working once the stick is gone. Credentials never leave
+Step 2 copies the installer, `restic-ctl` and the docs onto the machine, so one set up
+from a USB stick or a checkout keeps working once that is gone — on both platforms.
+`--tools-dir` / `-ToolsDir` moves the destination. Credentials never leave
 the data folder, which stays readable only by SYSTEM and Administrators (root on
 Linux).
 

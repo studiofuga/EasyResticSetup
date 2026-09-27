@@ -495,6 +495,21 @@ function Show-NasProvisionInstructions {
     if (-not $provision) { return }
     $name = Split-Path $provision -Leaf
 
+    # Each of these files carries ONE machine's public key and names ONE NAS account.
+    # Running another machine's authorizes that machine on its own account and does
+    # nothing here, while the failure looks identical - which has happened twice. So if a
+    # stranger is sitting next to us, say so before printing the instructions.
+    $others = @(Get-ChildItem (Join-Path $PSScriptRoot 'nas-provision-*.sh') -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -ne $provision })
+    if ($others.Count -gt 0) {
+        Write-Host ''
+        Write-Warn "Other machines' provisioning scripts are in this folder:"
+        foreach ($o in $others) { Write-Host ("            {0}" -f $o.Name) -ForegroundColor Yellow }
+        Write-Info "Run only $name. Another machine's script authorizes that machine on its"
+        Write-Info 'own NAS account and changes nothing here, while this step keeps failing'
+        Write-Info 'with the same "did not accept the key".'
+    }
+
     Write-Host ''
     Write-Host '    Everything the NAS needs is in this generated script:' -ForegroundColor Yellow
     Write-Host "      $provision"

@@ -86,13 +86,23 @@ PROGRESS="$BASE/progress.json"
 LAST_RUN="$BASE/last-run.json"
 HISTORY="$BASE/history.jsonl"
 
+# Checked before anything else, and after --help so that stays usable unprivileged.
+# Everything this script does needs the credentials in $BASE, which are root-only by
+# design: the config, the repository password, the SSH key, the log. So the honest
+# failure is one line about sudo, not a confusing error from whichever read came first.
+if [ "$(id -u)" != 0 ]; then
+    echo "restic-ctl needs root: the backup credentials in $BASE are root-only." >&2
+    echo "Try:  sudo restic-ctl ${CMD}" >&2
+    exit 1
+fi
+
 if [ ! -r "$CONFIG" ]; then
     if [ -r "$LEGACY_ENV" ]; then
         echo "This machine still uses the old settings.env." >&2
         echo "Run setup-restic-backup.sh --from 3 once; it converts it to config.json." >&2
     else
-        echo "No backup configured on this machine, or not running as root: $CONFIG unreadable." >&2
-        echo "Run setup-restic-backup.sh first, or use sudo." >&2
+        echo "No backup configured on this machine: $CONFIG not found." >&2
+        echo "Run setup-restic-backup.sh first." >&2
     fi
     exit 1
 fi
