@@ -196,7 +196,7 @@ $ErrorActionPreference = 'Stop'
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-$ScriptVersion = '2026.09.30.2'
+$ScriptVersion = '2026.09.30.4'
 
 # Which parameters the caller actually typed, as opposed to the ones that fell back
 # to a default. This is the whole basis of the configuration handling below: a
@@ -1281,6 +1281,8 @@ target
     .\restic-backup.ps1 -DryRun    list what would be backed up, no upload, no prune
     .\restic-backup.ps1 -Init      one-time: create the repository
     .\restic-backup.ps1 -Publish   re-send last-run.json to Home Assistant, no backup
+    .\restic-backup.ps1 -Publish -DryRun   print the topic and payload, send nothing
+    .\restic-backup.ps1 -Unpublish remove this machine from Home Assistant
     .\restic-backup.ps1 -Help      this text
 
   Prefer "restic-ctl run" over calling this by hand: it goes through the scheduler,
@@ -1291,6 +1293,7 @@ param(
     [switch]$Init,
     [switch]$DryRun,
     [switch]$Publish,
+    [switch]$Unpublish,
     [switch]$Help
 )
 
@@ -1302,6 +1305,8 @@ if ($Help) {
     Write-Host '    .\restic-backup.ps1 -DryRun    list what would be backed up, no upload, no prune'
     Write-Host '    .\restic-backup.ps1 -Init      one-time: create the repository'
     Write-Host '    .\restic-backup.ps1 -Publish   re-send last-run.json to Home Assistant'
+    Write-Host '    .\restic-backup.ps1 -Publish -DryRun   print topic and payload, send nothing'
+    Write-Host '    .\restic-backup.ps1 -Unpublish remove this machine from Home Assistant'
     Write-Host ''
     Write-Host '  Reads everything from config.json in this folder: paths, retention,'
     Write-Host '  the NAS alias. Writes the log, progress.json, last-run.json and'
@@ -1445,38 +1450,149 @@ function Read-MqttPacket($Stream) {
     return @{ Kind = [int]$kind; Body = [byte[]]$body }
 }
 
-# Returns 0 or 1 and leaves a one-line result in $script:HaMessage, so the value the
+# Home Assistant's default discovery prefix. It can only be changed in HA's own MQTT
+# settings, and hardly anyone does.
+$HaDiscoveryPrefix = 'homeassistant'
+# Every value the backup can write to "outcome". The Outcome entity is an enum, so HA's
+# history shows each one as its own colour band.
+$HaOutcomes = @('ok', 'warnings', 'failed', 'prune-failed', 'never')
+
+function Get-HaMachineId {
+    # One id for this machine, used as the MQTT client id and as the discovery id: the
+    # same string in both places lets a broker ACL grant each machine its own discovery
+    # topic with a single "pattern write homeassistant/device/%c/config". Both allow
+    # [A-Za-z0-9_-]. The box usually is the NAS account, restic-<host>, so the prefix
+    # is not doubled. 23 characters is the longest client id MQTT 3.1.1 obliges a
+    # broker to accept.
+    $id = $HaBox -replace '[^A-Za-z0-9_-]', ''
+    if (-not $id.StartsWith('restic')) { $id = "restic-$id" }
+    if ($id.Length -gt 23) { $id = $id.Substring(0, 23) }
+    return $id
+}
+
+function New-HaEntity([string]$Id, [string]$Key, [string]$Platform, [string]$Label,
+                      [string]$Template, $Extra) {
+    $e = [ordered]@{ platform = $Platform; name = $Label; unique_id = "${Id}_$Key"
+                     value_template = $Template }
+    if ($Extra) { foreach ($k in $Extra.Keys) { $e[$k] = $Extra[$k] } }
+    return $e
+}
+
+# The same device and entities restic-backup.sh announces on Linux, field for field.
+function Get-HaDiscovery([string]$Id) {
+    # HA names entities "<device> <entity>": "restic-desktop" + "Last run" becomes
+    # sensor.restic_desktop_last_run. A nickname box gets the same "restic" in front, so
+    # every machine's entities are sensor.restic_<name>_... and can be found together.
+    $name = if ($HaBox.StartsWith('restic', [StringComparison]::Ordinal)) { $HaBox } else { "Restic $HaBox" }
+    $bytes = [ordered]@{ device_class = 'data_size'; unit_of_measurement = 'B'
+                         state_class = 'measurement' }
+    # "| default(none)": a machine that has never run sends only outcome and host. A
+    # missing field then reads as unknown, rather than as a template error in HA's log
+    # on every message.
+    $components = [ordered]@{
+        outcome     = New-HaEntity $Id 'outcome' 'sensor' 'Outcome' '{{ value_json.outcome }}' ([ordered]@{
+                          device_class = 'enum'; options = $HaOutcomes; icon = 'mdi:backup-restore'
+                          # The whole record as attributes: snapshot id, file counts, host.
+                          json_attributes_topic = $HaTopic })
+        # The end of the last run, successful or not. Paired with a staleness check in
+        # HA, it is what catches a machine whose schedule stopped: a retained "ok"
+        # would otherwise stay "ok" forever.
+        last_run    = New-HaEntity $Id 'last_run' 'sensor' 'Last run' `
+                          '{{ value_json.finishedAt | default(none) }}' ([ordered]@{
+                          device_class = 'timestamp' })
+        duration    = New-HaEntity $Id 'duration' 'sensor' 'Duration' `
+                          '{{ value_json.durationSec | default(none) }}' ([ordered]@{
+                          device_class = 'duration'; unit_of_measurement = 's'
+                          state_class = 'measurement' })
+        data_added  = New-HaEntity $Id 'data_added' 'sensor' 'Data added' `
+                          '{{ value_json.dataAddedBytes | default(none) }}' $bytes
+        source_size = New-HaEntity $Id 'source_size' 'sensor' 'Source size' `
+                          '{{ value_json.bytesProcessed | default(none) }}' $bytes
+        # On for anything but "ok": warnings, failures, a failed prune, and a machine
+        # that has never backed up.
+        problem     = New-HaEntity $Id 'problem' 'binary_sensor' 'Problem' `
+                          "{{ 'OFF' if value_json.outcome == 'ok' else 'ON' }}" ([ordered]@{
+                          device_class = 'problem' })
+    }
+    return [ordered]@{
+        device      = [ordered]@{ identifiers = @($Id); name = $name
+                                  manufacturer = 'EasyResticSetup'; model = 'restic backup' }
+        origin      = [ordered]@{ name = 'EasyResticSetup' }
+        # At the root, so it applies to every component.
+        state_topic = $HaTopic
+        qos         = 1
+        components  = $components
+    }
+}
+
+# Tells Home Assistant about this machine and its latest outcome over MQTT. Two
+# retained messages on one connection, so HA has both again after it restarts:
+#
+#   homeassistant/device/<id>/config   MQTT discovery: the device and its entities.
+#                                      HA creates them the first time it sees this,
+#                                      so a new machine needs nothing on the HA side.
+#   <topic>, restic/<box> by default   the state: last-run.json plus box and
+#                                      publishedAt. Every entity reads its value from
+#                                      here.
+#
+# Discovery goes first, so HA is already subscribed to the state topic when the state
+# arrives. Both are sent on every run: an unchanged discovery message costs HA nothing,
+# and resending it brings a device back after someone deleted it in HA.
+#
+# Returns 0 or 1 and leaves the result text in $script:HaMessage, so the value the
 # function returns is never mixed with text on the output pipeline.
-function Send-HaStatus {
+#
+# -Remove sends empty retained messages on both topics instead: HA removes the device
+# and its entities, and the broker forgets the state.
+#
+# -Preview builds the messages and describes them instead of sending them: the broker
+# is not contacted and nothing is logged. It works without a broker configured, to
+# see what a machine would send before setting one up.
+function Send-HaStatus([switch]$Preview, [switch]$Remove) {
     $script:HaMessage = ''
-    if (-not $HaHost) { return 0 }
+    if (-not $HaHost -and -not $Preview) { return 0 }
     $client = $null
     try {
         if (-not $HaTopic -or $HaTopic.Contains('+') -or $HaTopic.Contains('#')) {
             throw "invalid topic '$HaTopic'"
         }
-        $record = $null
-        if (Test-Path $LastRunFile) {
-            try { $record = Get-Content $LastRunFile -Raw | ConvertFrom-Json } catch { $record = $null }
+        $deviceId = Get-HaMachineId
+        $configTopic = "$HaDiscoveryPrefix/device/$deviceId/config"
+
+        if ($Remove) {
+            # Empty and retained: that is how MQTT deletes a retained message, and how
+            # HA is told a discovered device is gone.
+            $messages = @(
+                [pscustomobject]@{ Topic = $configTopic; Payload = (New-Object byte[] 0) }
+                [pscustomobject]@{ Topic = $HaTopic;     Payload = (New-Object byte[] 0) }
+            )
+        } else {
+            $record = $null
+            if (Test-Path $LastRunFile) {
+                try { $record = Get-Content $LastRunFile -Raw | ConvertFrom-Json } catch { $record = $null }
+            }
+            # Nothing has run yet. Said explicitly rather than sending nothing, so HA can
+            # tell a machine that never backed up from one that is not reporting.
+            if (-not $record) { $record = [pscustomobject]@{ outcome = 'never'; host = $env:COMPUTERNAME } }
+            $record | Add-Member -NotePropertyName box -NotePropertyValue $HaBox -Force
+            $record | Add-Member -NotePropertyName publishedAt `
+                                 -NotePropertyValue (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz') -Force
+            $discovery = Get-HaDiscovery $deviceId
+            $utf8 = [System.Text.Encoding]::UTF8
+            $messages = @(
+                [pscustomobject]@{ Topic = $configTopic
+                                   Payload = $utf8.GetBytes(($discovery | ConvertTo-Json -Depth 8 -Compress)) }
+                [pscustomobject]@{ Topic = $HaTopic
+                                   Payload = $utf8.GetBytes(($record | ConvertTo-Json -Depth 6 -Compress)) }
+            )
         }
-        # Nothing has run yet. Said explicitly rather than sending nothing, so HA can
-        # tell a machine that never backed up from one that is not reporting.
-        if (-not $record) { $record = [pscustomobject]@{ outcome = 'never'; host = $env:COMPUTERNAME } }
-        $record | Add-Member -NotePropertyName box -NotePropertyValue $HaBox -Force
-        $record | Add-Member -NotePropertyName publishedAt `
-                             -NotePropertyValue (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz') -Force
-        $payload = [System.Text.Encoding]::UTF8.GetBytes(($record | ConvertTo-Json -Depth 6 -Compress))
 
         $password = ''
         if (Test-Path $HaPasswordFile) {
             $password = ([System.IO.File]::ReadAllText($HaPasswordFile)).Trim("`r", "`n")
         }
 
-        # 23 characters is the longest client id MQTT 3.1.1 obliges a broker to accept.
-        # The box usually is the NAS account, restic-<host>, so the prefix is not doubled.
-        $cid = $HaBox -replace '[^A-Za-z0-9_-]', ''
-        if (-not $cid.StartsWith('restic')) { $cid = "restic-$cid" }
-        if ($cid.Length -gt 23) { $cid = $cid.Substring(0, 23) }
+        $cid = $deviceId
 
         $flags = 0x02                                    # clean session
         $connect = New-Object System.IO.MemoryStream
@@ -1495,6 +1611,38 @@ function Send-HaStatus {
         $connect.WriteByte([byte]$flags)
         $connect.WriteByte(0); $connect.WriteByte(30)    # keep-alive, seconds
         $t = $tail.ToArray(); $connect.Write($t, 0, $t.Length)
+
+        if ($Preview) {
+            if ($HaHost) {
+                $u = if ($HaUser) { $HaUser } else { '<no user>' }
+                $broker = "$u@${HaHost}:$HaPort"
+                $auth = 'anonymous'
+                if ($HaUser) { $auth = if ($password) { 'password stored' } else { 'no password' } }
+            } else {
+                $broker = 'not configured - nothing would be sent'; $auth = '-'
+            }
+            $lines = @(
+                "Broker     $broker"
+                "Login      $auth"
+                "Client id  $cid"
+                'Delivery   QoS 1, retained'
+            )
+            if ($Remove) {
+                $lines += "Discovery  $configTopic, emptied"
+                $lines += "Topic      $HaTopic, emptied"
+            } else {
+                $lines += "Discovery  $configTopic, $($messages[0].Payload.Length) bytes"
+                $lines += "Topic      $HaTopic, $($messages[1].Payload.Length) bytes"
+                $lines += ''
+                $lines += 'Discovery payload:'
+                $lines += ($discovery | ConvertTo-Json -Depth 8)
+                $lines += ''
+                $lines += 'State payload:'
+                $lines += ($record | ConvertTo-Json -Depth 6)
+            }
+            $script:HaMessage = $lines -join "`n"
+            return 0
+        }
 
         $client = New-Object System.Net.Sockets.TcpClient
         $pending = $client.BeginConnect($HaHost, $HaPort, $null, $null)
@@ -1517,41 +1665,66 @@ function Send-HaStatus {
             throw "refused, code $code"
         }
 
-        # QoS 1 + retain: the broker confirms it has the message, and keeps it.
-        $pub = New-Object System.IO.MemoryStream
-        Add-MqttString $pub $HaTopic
-        $pub.WriteByte(0); $pub.WriteByte(1)             # packet id 1
-        $pub.Write($payload, 0, $payload.Length)
-        Send-MqttPacket $stream 0x33 $pub.ToArray()
-        while ($true) {
-            $ack = Read-MqttPacket $stream
-            if ((($ack.Kind -band 0xF0) -eq 0x40) -and $ack.Body.Length -ge 2 -and
-                $ack.Body[0] -eq 0 -and $ack.Body[1] -eq 1) { break }
+        # QoS 1 + retain: the broker confirms it has each message, and keeps it. One
+        # at a time, each waiting for its PUBACK, so the order holds.
+        $packetId = 0
+        foreach ($m in $messages) {
+            $packetId++
+            $pub = New-Object System.IO.MemoryStream
+            Add-MqttString $pub $m.Topic
+            $pub.WriteByte(0); $pub.WriteByte([byte]$packetId)
+            if ($m.Payload.Length -gt 0) { $pub.Write($m.Payload, 0, $m.Payload.Length) }
+            Send-MqttPacket $stream 0x33 $pub.ToArray()
+            while ($true) {
+                $ack = Read-MqttPacket $stream
+                if ((($ack.Kind -band 0xF0) -eq 0x40) -and $ack.Body.Length -ge 2 -and
+                    $ack.Body[0] -eq 0 -and $ack.Body[1] -eq $packetId) { break }
+            }
         }
         Send-MqttPacket $stream 0xE0 ([byte[]]@())
 
-        Write-Log "ha: published $($record.outcome) to $HaTopic on ${HaHost}:$HaPort"
-        $script:HaMessage = "published to $HaTopic on ${HaHost}:$HaPort"
+        if ($Remove) {
+            Write-Log "ha: unpublished $configTopic and $HaTopic on ${HaHost}:$HaPort"
+            $script:HaMessage = "removed from Home Assistant: $configTopic and $HaTopic cleared on ${HaHost}:$HaPort"
+        } else {
+            Write-Log "ha: published $($record.outcome) to $HaTopic on ${HaHost}:$HaPort, discovery $configTopic"
+            $script:HaMessage = "published to $HaTopic on ${HaHost}:$HaPort, discovery $configTopic"
+        }
         return 0
     } catch {
         # .NET calls arrive wrapped ("Exception calling EndConnect ..."); the inner
         # exception is the one that says what actually happened.
         $e = $_.Exception
         while ($e.InnerException) { $e = $e.InnerException }
-        Write-Log "ha: publish FAILED: $($e.Message)"
-        $script:HaMessage = "publish failed: $($e.Message)"
+        if ($Preview) {
+            $script:HaMessage = "cannot build the message: $($e.Message)"
+            return 1
+        }
+        $what = if ($Remove) { 'unpublish' } else { 'publish' }
+        Write-Log "ha: $what FAILED: $($e.Message)"
+        $script:HaMessage = "$what failed: $($e.Message)"
         return 1
     } finally {
         if ($client) { $client.Close() }
     }
 }
 
-if ($Publish) {
+if ($Publish -and $Unpublish) {
+    Write-Output '-Publish and -Unpublish are opposites: give one of them.'
+    exit 2
+}
+if ($Publish -or $Unpublish) {
+    # -DryRun together with either previews the messages; it never runs a backup.
+    if ($DryRun) {
+        $rc = Send-HaStatus -Preview -Remove:$Unpublish
+        Write-Output $script:HaMessage
+        exit $rc
+    }
     if (-not $HaHost) {
         Write-Output "Home Assistant is not configured (no homeAssistant.host in $ConfigFile)."
         exit 2
     }
-    $rc = Send-HaStatus
+    $rc = Send-HaStatus -Remove:$Unpublish
     Write-Output $script:HaMessage
     exit $rc
 }

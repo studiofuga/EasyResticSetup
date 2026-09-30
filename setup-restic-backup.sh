@@ -30,7 +30,7 @@ set -u
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-SCRIPT_VERSION='2026.09.30.2'
+SCRIPT_VERSION='2026.09.30.4'
 
 # ---- defaults ---------------------------------------------------------------
 # No default on purpose: nothing site-specific is baked into this script. The NAS
@@ -920,6 +920,8 @@ EOF
 #   restic-backup.sh --dry-run    list what would be backed up, no upload
 #   restic-backup.sh --init       one-time: create the repository
 #   restic-backup.sh --publish    re-send last-run.json to Home Assistant, no backup
+#   restic-backup.sh --publish --dry-run   print the topic and payload, send nothing
+#   restic-backup.sh --unpublish  remove this machine from Home Assistant
 #   restic-backup.sh --help       this text
 #
 # Prefer "restic-ctl run" over calling this by hand: it goes through systemd, so the
@@ -938,7 +940,7 @@ HISTORY="$BASE/history.jsonl"
 # missing, which is exactly when someone reaches for it.
 case "${1:-}" in
     -h|--help)
-        sed -n '2,13p' "$0" | sed 's/^#//; s/^ //'
+        sed -n '2,15p' "$0" | sed 's/^#//; s/^ //'
         echo
         echo "Reads everything from $CONFIG: paths, retention, the NAS alias."
         echo 'Writes the log, progress.json, last-run.json and history.jsonl.'
@@ -996,8 +998,20 @@ case "${1:-}" in
     --init)    MODE='init' ;;
     --dry-run) MODE='dryrun' ;;
     --publish) MODE='publish' ;;
+    --unpublish) MODE='unpublish' ;;
     '')        ;;
     *)         echo "unknown option: $1" >&2; exit 2 ;;
+esac
+# --dry-run after --publish or --unpublish previews the messages instead of sending
+# them. Checked as a pair so that "--dry-run --publish", which reads like a dry-run
+# backup, is refused rather than silently doing one or the other.
+PUBLISH_DRY=0
+case "${2:-}" in
+    '') ;;
+    --dry-run) case "$MODE" in publish|unpublish) ;;
+                   *) echo "unknown option: $2" >&2; exit 2 ;; esac
+               PUBLISH_DRY=1 ;;
+    *)  echo "unknown option: $2" >&2; exit 2 ;;
 esac
 
 log() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
@@ -1091,21 +1105,55 @@ for raw in sys.stdin:
     fi
 }
 
-# Publishes last-run.json to Home Assistant's MQTT broker, retained, so HA shows the
-# latest outcome even after it restarts. Plain MQTT 3.1.1 over a socket, in python3
-# which is already required: no client package on every machine, and the password is
-# read from its file here instead of passing through a command line where any local
-# user could read it in the process list.
+# Tells Home Assistant about this machine and its latest outcome over MQTT. Two
+# retained messages on one connection, so HA has both again after it restarts:
+#
+#   homeassistant/device/<id>/config   MQTT discovery: the device and its entities.
+#                                      HA creates them the first time it sees this,
+#                                      so a new machine needs nothing on the HA side.
+#   <topic>, restic/<box> by default   the state: last-run.json plus box and
+#                                      publishedAt. Every entity reads its value
+#                                      from here.
+#
+# Discovery goes first, so HA is already subscribed to the state topic when the
+# state arrives. Both are sent on every run: an unchanged discovery message costs HA
+# nothing, and resending it brings a device back after someone deleted it in HA.
+#
+# Plain MQTT 3.1.1 over a socket, in python3 which is already required: no client
+# package on every machine, and the password is read from its file here instead of
+# passing through a command line where any local user could read it in the process
+# list.
 #
 # Never allowed to change the backup's own result: a broker that is down is logged,
 # and the run exits exactly as it would have without it.
+#
+# Modes:
+#   send            the two messages above (the default)
+#   dry             build them and print them: the broker is not contacted and
+#                   nothing is logged. Works without a broker configured, to preview
+#                   what a machine would send before setting one up.
+#   unpublish       empty retained messages on both topics: HA removes the device and
+#                   its entities, and the broker forgets the state
+#   unpublish-dry   print what unpublish would clear
 ha_publish() {
-    [ -n "$HA_HOST" ] || return 0
+    case "${1:-send}" in
+        dry|unpublish-dry) ;;
+        *) [ -n "$HA_HOST" ] || return 0 ;;
+    esac
     python3 - "$HA_HOST" "$HA_PORT" "$HA_USER" "$HA_PASSWORD_FILE" "$HA_TOPIC" \
-              "$HA_BOX" "$LAST_RUN" "$LOG" <<'HA_PY_EOF'
+              "$HA_BOX" "$LAST_RUN" "$LOG" "${1:-send}" <<'HA_PY_EOF'
 import datetime, json, os, re, socket, struct, sys, time
 
-host, port, user, pwfile, topic, box, last_run, logpath = sys.argv[1:9]
+host, port, user, pwfile, topic, box, last_run, logpath, mode = sys.argv[1:10]
+dry = mode.endswith("dry")
+removing = mode.startswith("unpublish")
+
+# Home Assistant's default discovery prefix. It can only be changed in HA's own MQTT
+# settings, and hardly anyone does.
+DISCOVERY_PREFIX = "homeassistant"
+# Every value the backup can write to "outcome". The Outcome entity is an enum, so
+# HA's history shows each one as its own colour band.
+OUTCOMES = ["ok", "warnings", "failed", "prune-failed", "never"]
 
 def logline(msg):
     with open(logpath, "a") as f:
@@ -1144,29 +1192,106 @@ def read_packet(sock):
         shift += 7
     return kind, recv_exact(sock, length)
 
+def machine_id(box):
+    # One id for this machine, used as the MQTT client id and as the discovery id:
+    # the same string in both places lets a broker ACL grant each machine its own
+    # discovery topic with a single "pattern write homeassistant/device/%c/config".
+    # Both allow [A-Za-z0-9_-]. The box usually is the NAS account, restic-<host>, so
+    # the prefix is not doubled. 23 characters is the longest client id MQTT 3.1.1
+    # obliges a broker to accept.
+    cid = re.sub(r"[^A-Za-z0-9_-]", "", box)
+    return (cid if cid.startswith("restic") else "restic-" + cid)[:23]
+
+def discovery_config(ident):
+    # HA names entities "<device> <entity>": "restic-laptop" + "Last run" becomes
+    # sensor.restic_laptop_last_run. A nickname box gets the same "restic" in front,
+    # so every machine's entities are sensor.restic_<name>_... and can be found
+    # together.
+    name = box if box.startswith("restic") else "Restic " + box
+
+    def entity(key, platform, label, field, **extra):
+        e = {"platform": platform, "name": label, "unique_id": ident + "_" + key,
+             "value_template": field}
+        e.update(extra)
+        return e
+
+    # "| default(none)": a machine that has never run sends only outcome and host.
+    # A missing field then reads as unknown, rather than as a template error in HA's
+    # log on every message.
+    return {
+        "device": {"identifiers": [ident], "name": name,
+                   "manufacturer": "EasyResticSetup", "model": "restic backup"},
+        "origin": {"name": "EasyResticSetup"},
+        # At the root, so it applies to every component below.
+        "state_topic": topic,
+        "qos": 1,
+        "components": {
+            "outcome": entity(
+                "outcome", "sensor", "Outcome", "{{ value_json.outcome }}",
+                device_class="enum", options=OUTCOMES, icon="mdi:backup-restore",
+                # The whole record as attributes: snapshot id, file counts, host.
+                json_attributes_topic=topic),
+            # The end of the last run, successful or not. Paired with a staleness
+            # check in HA, it is what catches a machine whose schedule stopped: a
+            # retained "ok" would otherwise stay "ok" forever.
+            "last_run": entity(
+                "last_run", "sensor", "Last run",
+                "{{ value_json.finishedAt | default(none) }}",
+                device_class="timestamp"),
+            "duration": entity(
+                "duration", "sensor", "Duration",
+                "{{ value_json.durationSec | default(none) }}",
+                device_class="duration", unit_of_measurement="s",
+                state_class="measurement"),
+            "data_added": entity(
+                "data_added", "sensor", "Data added",
+                "{{ value_json.dataAddedBytes | default(none) }}",
+                device_class="data_size", unit_of_measurement="B",
+                state_class="measurement"),
+            "source_size": entity(
+                "source_size", "sensor", "Source size",
+                "{{ value_json.bytesProcessed | default(none) }}",
+                device_class="data_size", unit_of_measurement="B",
+                state_class="measurement"),
+            # On for anything but "ok": warnings, failures, a failed prune, and a
+            # machine that has never backed up.
+            "problem": entity(
+                "problem", "binary_sensor", "Problem",
+                "{{ 'OFF' if value_json.outcome == 'ok' else 'ON' }}",
+                device_class="problem"),
+        },
+    }
+
 try:
     if not topic or "+" in topic or "#" in topic:
         raise ValueError("invalid topic %r" % topic)
-    try:
-        with open(last_run) as f:
-            record = json.load(f)
-    except (OSError, ValueError):
-        # Nothing has run yet. Said explicitly rather than sending nothing, so HA can
-        # tell a machine that never backed up from one that is not reporting.
-        record = {"outcome": "never", "host": socket.gethostname()}
-    record["box"] = box
-    record["publishedAt"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-    payload = json.dumps(record).encode("utf-8")
+    ident = machine_id(box)
+    config_topic = "%s/device/%s/config" % (DISCOVERY_PREFIX, ident)
+
+    if removing:
+        # Empty and retained: that is how MQTT deletes a retained message, and how
+        # HA is told a discovered device is gone.
+        messages = [(config_topic, b""), (topic, b"")]
+    else:
+        try:
+            with open(last_run) as f:
+                record = json.load(f)
+        except (OSError, ValueError):
+            # Nothing has run yet. Said explicitly rather than sending nothing, so HA
+            # can tell a machine that never backed up from one that is not reporting.
+            record = {"outcome": "never", "host": socket.gethostname()}
+        record["box"] = box
+        record["publishedAt"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+        discovery = discovery_config(ident)
+        messages = [(config_topic, json.dumps(discovery).encode("utf-8")),
+                    (topic, json.dumps(record).encode("utf-8"))]
 
     password = ""
     if os.path.exists(pwfile):
         with open(pwfile) as f:
             password = f.read().strip()
 
-    # 23 characters is the longest client id MQTT 3.1.1 obliges a broker to accept.
-    # The box usually is the NAS account, restic-<host>, so the prefix is not doubled.
-    cid = re.sub(r"[^A-Za-z0-9_-]", "", box)
-    client_id = (cid if cid.startswith("restic") else "restic-" + cid)[:23]
+    client_id = ident
     flags = 0x02                                   # clean session
     tail = s(client_id)
     if user:
@@ -1175,6 +1300,30 @@ try:
         if password:                               # 3.1.1: no password without a user
             flags |= 0x40
             tail += s(password)
+
+    if dry:
+        if host:
+            broker = "%s@%s:%s" % (user or "<no user>", host, port)
+            auth = ("password stored" if password else "no password") if user else "anonymous"
+        else:
+            broker, auth = "not configured - nothing would be sent", "-"
+        print("Broker     %s" % broker)
+        print("Login      %s" % auth)
+        print("Client id  %s" % client_id)
+        print("Delivery   QoS 1, retained")
+        if removing:
+            print("Discovery  %s, emptied" % config_topic)
+            print("Topic      %s, emptied" % topic)
+        else:
+            print("Discovery  %s, %d bytes" % (config_topic, len(messages[0][1])))
+            print("Topic      %s, %d bytes" % (topic, len(messages[1][1])))
+            print("")
+            print("Discovery payload:")
+            print(json.dumps(discovery, indent=2))
+            print("")
+            print("State payload:")
+            print(json.dumps(record, indent=2))
+        sys.exit(0)
 
     sock = socket.create_connection((host, int(port)), timeout=15)
     try:
@@ -1188,30 +1337,46 @@ try:
                        5: "not authorized"}
             raise PermissionError(reasons.get(body[1], "refused, code %d" % body[1]))
 
-        # QoS 1 + retain: the broker confirms it has the message, and keeps it.
-        sock.sendall(packet(0x33, s(topic) + struct.pack("!H", 1) + payload))
-        while True:
-            kind, body = read_packet(sock)
-            if kind & 0xF0 == 0x40 and body[:2] == struct.pack("!H", 1):
-                break
+        # QoS 1 + retain: the broker confirms it has each message, and keeps it.
+        # One at a time, each waiting for its PUBACK, so the order holds.
+        for pid, (t, payload) in enumerate(messages, 1):
+            sock.sendall(packet(0x33, s(t) + struct.pack("!H", pid) + payload))
+            while True:
+                kind, body = read_packet(sock)
+                if kind & 0xF0 == 0x40 and body[:2] == struct.pack("!H", pid):
+                    break
         sock.sendall(bytes([0xE0, 0]))
     finally:
         sock.close()
-    logline("published %s to %s on %s:%s" % (record.get("outcome"), topic, host, port))
-    print("published to %s on %s:%s" % (topic, host, port))
+    if removing:
+        logline("unpublished %s and %s on %s:%s" % (config_topic, topic, host, port))
+        print("removed from Home Assistant: %s and %s cleared on %s:%s"
+              % (config_topic, topic, host, port))
+    else:
+        logline("published %s to %s on %s:%s, discovery %s"
+                % (record.get("outcome"), topic, host, port, config_topic))
+        print("published to %s on %s:%s, discovery %s" % (topic, host, port, config_topic))
 except Exception as e:
-    logline("publish FAILED: %s" % e)
-    print("publish failed: %s" % e, file=sys.stderr)
+    if dry:
+        print("cannot build the message: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    what = "unpublish" if removing else "publish"
+    logline("%s FAILED: %s" % (what, e))
+    print("%s failed: %s" % (what, e), file=sys.stderr)
     sys.exit(1)
 HA_PY_EOF
 }
 
-if [ "$MODE" = 'publish' ]; then
+if [ "$MODE" = 'publish' ] || [ "$MODE" = 'unpublish' ]; then
+    if [ "$PUBLISH_DRY" = 1 ]; then
+        if [ "$MODE" = 'publish' ]; then ha_publish dry; else ha_publish unpublish-dry; fi
+        exit $?
+    fi
     if [ -z "$HA_HOST" ]; then
         echo "Home Assistant is not configured (no homeAssistant.host in $CONFIG)." >&2
         exit 2
     fi
-    ha_publish
+    if [ "$MODE" = 'publish' ]; then ha_publish; else ha_publish unpublish; fi
     exit $?
 fi
 

@@ -20,7 +20,9 @@ command take".
   - [status](#restic-ctl-status) · [snapshots](#restic-ctl-snapshots) ·
     [run](#restic-ctl-run) · [check](#restic-ctl-check) ·
     [schedule](#restic-ctl-schedule) · [history](#restic-ctl-history) ·
-    [log](#restic-ctl-log) · [config](#restic-ctl-config) · [help](#restic-ctl-help)
+    [log](#restic-ctl-log) · [config](#restic-ctl-config) ·
+    [publish](#restic-ctl-publish) · [unpublish](#restic-ctl-unpublish) ·
+    [help](#restic-ctl-help)
   - [exec](#restic-ctl-exec) · [forget](#restic-ctl-forget) ·
     [restore](#restic-ctl-restore) · [unlock](#restic-ctl-unlock) ·
     [ls](#restic-ctl-ls) · [find](#restic-ctl-find)
@@ -97,6 +99,9 @@ also run `.\restic-ctl.ps1` or `./restic-ctl.sh` directly.
 | Prove a restore works, no disk | `restic-ctl exec dump latest "C:/…/file" > NUL` | `sudo restic-ctl exec dump latest /…/file > /dev/null` |
 | Delete a snapshot | `restic-ctl forget <id> --dry-run` first | same |
 | Any restic command | `restic-ctl exec <args>` | `sudo restic-ctl exec <args>` |
+| What would Home Assistant get? | `restic-ctl publish --dry-run` | `sudo restic-ctl publish --dry-run` |
+| Send it to Home Assistant now | `restic-ctl publish` | `sudo restic-ctl publish` |
+| Remove the machine from Home Assistant | `restic-ctl unpublish` | `sudo restic-ctl unpublish` |
 | Install or repair | `.\Setup-ResticBackup.ps1` | `sudo ./setup-restic-backup.sh` |
 | Update to newer scripts | `.\Setup-ResticBackup.ps1 -Update` | `sudo ./setup-restic-backup.sh --update` |
 | Whole fleet, from the NAS | `sudo sh nas-fleet-status.sh` (on the NAS) | same |
@@ -332,6 +337,85 @@ needed and never stored. Two copies of the same string is one copy too many.
 To change anything here, edit `config.json` and re-run the installer from step 3 so the
 generated files follow. The exception is the schedule, which has its own command.
 
+### `restic-ctl publish`
+
+```
+restic-ctl publish [--dry-run]          (-DryRun works too)
+sudo restic-ctl publish [--dry-run]
+```
+
+Sends this machine's backup state to Home Assistant now: the same two messages the
+backup sends at the end of every run, QoS 1, retained, to the broker in the
+`homeAssistant` section of `config.json`:
+
+- `homeassistant/device/<id>/config`, MQTT discovery: Home Assistant creates the
+  device and its entities from it, so nothing is configured there for each machine;
+- `restic/<box>`, the state: `last-run.json` plus `box` and `publishedAt`.
+
+Use it to check the broker settings without waiting for a backup, or to put a
+machine back after its retained messages were cleared. What the entities are, and
+the broker ACL they need, is in `HOME-ASSISTANT.md`.
+
+`--dry-run` prints what would be sent and sends nothing: broker, login (only whether a
+password is stored, never the password), client id, both topics with their sizes, and
+both payloads. It does not contact the broker, writes nothing to the log, and also
+works before a broker is configured.
+
+```
+  Home Assistant messages (dry run, nothing sent)
+  -----------------------------------------------
+  Broker            <mqtt-user>@<broker>:1883
+  Login             password stored
+  Client id         restic-<machine>
+  Delivery          QoS 1, retained
+  Discovery         homeassistant/device/restic-<machine>/config, 1681 bytes
+  Topic             restic/restic-<machine>, 358 bytes
+
+    Discovery payload:
+    {
+      "device": { "identifiers": ["restic-<machine>"], "name": "restic-<machine>", ... },
+      "state_topic": "restic/restic-<machine>",
+      "components": { "outcome": {...}, "last_run": {...}, ... }
+    }
+
+    State payload:
+    {
+      "startedAt": "...",
+      "outcome": "ok",
+      ...
+      "box": "restic-<machine>",
+      "publishedAt": "..."
+    }
+```
+
+The work is done by the installed backup script (`--publish`, `--publish --dry-run`), not
+by a second copy of the MQTT code, so the preview is by construction what a scheduled run
+sends. On a machine whose backup script predates the command, or predates discovery, it
+says so and exits 1: bring it up to date with the installer's `--update` / `-Update`.
+
+Exit codes: 0 sent or previewed, 1 the broker did not accept it, 2 Home Assistant is not
+configured.
+
+### `restic-ctl unpublish`
+
+```
+restic-ctl unpublish [--dry-run]        (-DryRun works too)
+sudo restic-ctl unpublish [--dry-run]
+```
+
+Removes this machine from Home Assistant: an empty retained message on each of the two
+topics `publish` uses. Home Assistant deletes the device and its entities, and the
+broker forgets the last state. `--dry-run` prints the two topics and sends nothing.
+
+The next backup announces the machine again, so to retire one, stop its schedule first:
+
+```
+Disable-ScheduledTask -TaskName restic-backup ; restic-ctl unpublish
+sudo systemctl disable --now restic-backup.timer && sudo restic-ctl unpublish
+```
+
+Exit codes as for `publish`.
+
 ### `restic-ctl help`
 
 ```
@@ -513,8 +597,10 @@ exactly what to run on the NAS; then you re-run the installer and it continues.
 ### Home Assistant reporting (optional, any run)
 
 After every backup the outcome is published over MQTT, **retained**, to the broker Home
-Assistant uses. Off until an HA host is given; stored in `config.json` like everything
-else, so it is typed once.
+Assistant uses, together with an MQTT discovery message, so the machine appears in Home
+Assistant as a device without any configuration there. Off until an HA host is given;
+stored in `config.json` like everything else, so it is typed once. The Home Assistant and
+broker side, ACL included, is in `HOME-ASSISTANT.md`.
 
 | Windows | Linux | Default | Notes |
 |---|---|---|---|
@@ -533,9 +619,11 @@ is already set up is a single step:
 sudo ./setup-restic-backup.sh --only 3 --ha-host <broker> --ha-user <mqtt-user>
 ```
 
-The message is the content of `last-run.json` plus `box` and `publishedAt`. On a machine
-that has never run a backup, `outcome` is `never`. It is sent after every real run —
-success, failure, or failed prune — and never after a dry run. A broker that is down or
+Two messages go out: the discovery message on `homeassistant/device/<id>/config`, then
+the state on the topic above, which is the content of `last-run.json` plus `box` and
+`publishedAt`. On a machine that has never run a backup, `outcome` is `never`. Both are
+sent after every real run — success, failure, or failed prune — and never after a dry
+run. A broker that is down or
 refuses the login is logged (`ha: publish FAILED: …`) and changes nothing about the
 backup's own result or exit code.
 
@@ -623,16 +711,26 @@ that actually matters.
 .\restic-backup.ps1 -Help
 
 .\restic-backup.ps1 -Publish   re-send last-run.json to Home Assistant, no backup
+.\restic-backup.ps1 -Publish -DryRun   print the topic and payload, send nothing
+.\restic-backup.ps1 -Unpublish   remove this machine from Home Assistant
+.\restic-backup.ps1 -Unpublish -DryRun
 
 restic-backup.sh               normal run (what the service does)
 restic-backup.sh --dry-run
 restic-backup.sh --init
 restic-backup.sh --publish
+restic-backup.sh --publish --dry-run
+restic-backup.sh --unpublish
+restic-backup.sh --unpublish --dry-run
 restic-backup.sh --help
 ```
 
-`-Publish` / `--publish` exits 0 when the broker confirmed the message, 1 when it did
-not (the reason is printed and logged), 2 when Home Assistant is not configured.
+`-Publish` / `--publish` sends the discovery and state messages; `-Unpublish` /
+`--unpublish` empties both. Each exits 0 when the broker confirmed the messages, 1 when
+it did not (the reason is printed and logged), 2 when Home Assistant is not configured.
+With `-DryRun` / `--dry-run` after it, it prints the messages instead and always exits 0
+unless they cannot be built. `restic-ctl publish` and `restic-ctl unpublish` are the
+friendlier way in.
 
 It reads everything from `config.json` and writes the log, `progress.json`,
 `last-run.json` and `history.jsonl`. On Windows it uses `--use-fs-snapshot` (VSS), which

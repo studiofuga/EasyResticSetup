@@ -15,6 +15,8 @@
       history     table of recent runs, including failed ones
       log         tail the backup log
       config      the effective settings of this machine
+      publish     send the last result to Home Assistant now (--dry-run: show it)
+      unpublish   remove this machine from Home Assistant
       help        the command list, or the detail for one command
 
     And, as a wrapper over restic itself, so the repository, the password file
@@ -64,13 +66,17 @@
     .\restic-ctl.ps1 schedule 03:30       # move it, and re-register the task
 
 .EXAMPLE
+    .\restic-ctl.ps1 publish --dry-run   # the MQTT topics and payloads, nothing sent
+
+.EXAMPLE
     .\restic-ctl.ps1 help forget
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
     [ValidateSet('status', 'snapshots', 'run', 'check', 'schedule', 'history', 'log',
-                 'config', 'exec', 'forget', 'restore', 'unlock', 'ls', 'find', 'help')]
+                 'config', 'exec', 'forget', 'restore', 'unlock', 'ls', 'find', 'publish',
+                 'unpublish', 'help')]
     [string] $Command = 'status',
 
     [string] $Base   = 'C:\ProgramData\restic',
@@ -87,6 +93,8 @@ param(
     [string] $Target,        # restore: where to restore to
     [string] $TaskName = 'restic-backup',
     [switch] $Help,          # same as the help command, so -Help works anywhere
+    [switch] $DryRun,        # publish, unpublish: print the messages, send nothing
+                             # (--dry-run, the Linux spelling, works too)
 
     # schedule: 0 means "leave whatever is stored alone". The three of them used to be
     # parameters of Setup-ResticBackup.ps1, where they were the wrong shape: the
@@ -104,7 +112,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$CtlVersion = '2026.09.27.2'
+$CtlVersion = '2026.09.30.2'
 
 # Which parameters were actually typed. "schedule -TimeLimitHours 0" has to be told
 # apart from "schedule" with the default still sitting there.
@@ -147,6 +155,10 @@ ACTING
   forget <id>...      delete snapshots and prune, with a confirmation step
   restore [<id>]      restore a snapshot into a folder
   unlock              clear a stale repository lock
+  publish [--dry-run] send this machine's last result to Home Assistant now;
+                      --dry-run prints the topic and payload and sends nothing
+  unpublish [--dry-run]
+                      remove this machine's device and state from Home Assistant
 
 PASSTHROUGH  (restic itself, with this machine's repository, password file and
               sftp.command already filled in)
@@ -411,6 +423,61 @@ then fails with "repository is already locked".
 Only run this when no backup is actually running. Check with "restic-ctl status"
 first: removing the lock out from under a live run is how a repository gets
 damaged.
+'@
+
+$HelpTopics['publish'] = @'
+restic-ctl publish - send this machine's backup state to Home Assistant.
+
+  restic-ctl publish             send it now
+  restic-ctl publish --dry-run   print the topics and the payloads, send nothing
+                                 (-DryRun works too)
+
+The same two messages the backup sends at the end of every run, over MQTT with QoS 1
+and the retain flag, to the broker in the homeAssistant section of config.json:
+
+  homeassistant/device/<id>/config   MQTT discovery. Home Assistant creates the
+                                     device and its entities from it, so nothing
+                                     is configured on the HA side for each machine.
+  restic/<box>                       the state: last-run.json plus "box" and
+                                     "publishedAt". A machine that has never run a
+                                     backup sends outcome "never".
+
+Use it to check the broker settings without waiting for a backup, or to put a
+machine's state back after the retained message was cleared on the broker.
+
+--dry-run does not contact the broker and writes nothing to the log. It also works
+before a broker is configured, to see what the machine would send; the password
+is never printed, only whether one is stored.
+
+The work is done by restic-backup.ps1 (-Publish, -Publish -DryRun), so this
+command reports exactly what a scheduled run would send. A machine whose
+restic-backup.ps1 predates it says so: re-run Setup-ResticBackup.ps1 -Update.
+
+Exit codes: 0 sent (or previewed), 1 the broker did not accept it, 2 Home
+Assistant is not configured.
+'@
+
+$HelpTopics['unpublish'] = @'
+restic-ctl unpublish - remove this machine from Home Assistant.
+
+  restic-ctl unpublish             remove it now
+  restic-ctl unpublish --dry-run   print the two topics it would clear
+                                   (-DryRun works too)
+
+Sends an empty retained message to both topics publish uses. Home Assistant removes
+the device and its entities, and the broker forgets the last state.
+
+The next backup announces the machine again. To retire it, stop the scheduled task
+first, then unpublish (from an elevated prompt):
+
+  Disable-ScheduledTask -TaskName restic-backup
+  restic-ctl unpublish
+
+A machine that no longer exists can be removed from Home Assistant itself:
+Settings > Devices & services > MQTT > the device > Delete.
+
+Exit codes: 0 removed (or previewed), 1 the broker did not accept it, 2 Home
+Assistant is not configured.
 '@
 
 $HelpTopics['ls'] = @'
@@ -1576,6 +1643,81 @@ function Invoke-Find {
     Write-Host ''
 }
 
+# ============================================================== publish
+
+# Delegates to the backup script rather than carrying a second copy of the MQTT code:
+# what this sends, or previews, is by construction what the scheduled run sends.
+# Serves both publish and unpublish.
+function Invoke-Publish([switch]$Remove) {
+    $dry = $DryRun -or ($Rest -contains '--dry-run')
+    $other = @($Rest | Where-Object { $_ -ne '--dry-run' })
+    if ($other.Count -gt 0) {
+        Write-Host "unknown option: $($other[0])" -ForegroundColor Red
+        exit 2
+    }
+
+    $backupScript = Join-Path $Base 'restic-backup.ps1'
+    if (-not (Test-Path $backupScript)) {
+        Write-Fail "$backupScript not found - run Setup-ResticBackup.ps1"
+        exit 1
+    }
+    # Discovery came after -Publish: a script that has -Publish but no discovery would
+    # report success while Home Assistant shows no device.
+    $marker = if ($Remove) { '[switch]$Unpublish' } else { '$HaDiscoveryPrefix' }
+    if (-not (Select-String -Path $backupScript -SimpleMatch $marker -Quiet)) {
+        Write-Host ''
+        Write-Fail 'the installed restic-backup.ps1 predates this command'
+        Write-Info 'Bring it up to date:  .\Setup-ResticBackup.ps1 -Update'
+        Write-Info '(from the copy you brought, or from the tools folder)'
+        Write-Host ''
+        exit 1
+    }
+
+    $action = if ($Remove) { '-Unpublish' } else { '-Publish' }
+    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $backupScript, $action)
+    if ($dry) { $psArgs += '-DryRun' }
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $out = @(& powershell.exe @psArgs 2>&1 | ForEach-Object { "$_" })
+        $rc = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+
+    if ($dry) {
+        if ($Remove) { Write-Head 'Home Assistant removal (dry run, nothing sent)' }
+        else         { Write-Head 'Home Assistant messages (dry run, nothing sent)' }
+        # The first lines are "Label  value" (two or more spaces between them, the
+        # label may itself contain one); the JSON after them is shown as-is.
+        foreach ($line in $out) {
+            if ($line -match '^([A-Z][^ ]*(?: [^ ]+)?)  +(.*)$') {
+                Write-Field $Matches[1] $Matches[2]
+            } else {
+                Write-Host "    $line"
+            }
+        }
+        Write-Host ''
+        exit $rc
+    }
+
+    Write-Head 'Home Assistant'
+    $msg = ($out | Where-Object { $_.Trim() }) -join ' '
+    switch ($rc) {
+        0       { Write-Ok $msg
+                  if ($Remove) {
+                      Write-Info 'The next backup announces it again. To retire the machine, first:'
+                      Write-Info "Disable-ScheduledTask -TaskName $TaskName"
+                  } }
+        2       { Write-Field 'State' 'not configured' 'DarkGray'
+                  Write-Info 'Enable it with: .\Setup-ResticBackup.ps1 -Only 3 -HaHost <broker> -HaUser <user>' }
+        default { Write-Fail $msg
+                  Write-Info 'Details in the log:  restic-ctl log' }
+    }
+    Write-Host ''
+    exit $rc
+}
+
 # ============================================================== dispatch
 
 if (-not (Get-Command restic.exe -ErrorAction SilentlyContinue)) {
@@ -1598,4 +1740,6 @@ switch ($Command) {
     'unlock'    { Invoke-Unlock }
     'ls'        { Invoke-Ls }
     'find'      { Invoke-Find }
+    'publish'   { Invoke-Publish }
+    'unpublish' { Invoke-Publish -Remove }
 }

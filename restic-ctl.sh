@@ -14,6 +14,8 @@
 #    history     table of recent runs, including failed ones
 #    log         tail the backup log
 #    config      the effective settings of this machine
+#    publish     send the last result to Home Assistant now (--dry-run: show it)
+#    unpublish   remove this machine from Home Assistant
 #    help        the command list, or the detail for one command
 #
 #  And, as a wrapper over restic itself, so the repository, the password file
@@ -57,6 +59,7 @@ REST=''
 SUBSET='1/12'
 
 RETRY=''
+PUB_DRY=0
 
 # ------------------------------------------------------------------- help
 #
@@ -94,6 +97,10 @@ ACTING
   forget <id>...      delete snapshots and prune, with a confirmation step
   restore [<id>]      restore a snapshot into a directory
   unlock              clear a stale repository lock
+  publish [--dry-run] send this machine's last result to Home Assistant now;
+                      --dry-run prints the topic and payload and sends nothing
+  unpublish [--dry-run]
+                      remove this machine's device and state from Home Assistant
 
 PASSTHROUGH  (restic itself, with this machine's repository, password file and
               sftp.command already filled in)
@@ -384,6 +391,59 @@ to hand to restore or dump.
   sudo restic-ctl ls b9dd1b6d --long
 T_EOF
         ;;
+    publish) cat <<'T_EOF'
+restic-ctl publish - send this machine's backup state to Home Assistant.
+
+  sudo restic-ctl publish             send it now
+  sudo restic-ctl publish --dry-run   print the topics and the payloads, send nothing
+
+The same two messages the backup sends at the end of every run, over MQTT with QoS 1
+and the retain flag, to the broker in the homeAssistant section of config.json:
+
+  homeassistant/device/<id>/config   MQTT discovery. Home Assistant creates the
+                                     device and its entities from it, so nothing
+                                     is configured on the HA side for each machine.
+  restic/<box>                       the state: last-run.json plus "box" and
+                                     "publishedAt". A machine that has never run a
+                                     backup sends outcome "never".
+
+Use it to check the broker settings without waiting for a backup, or to put a
+machine's state back after the retained message was cleared on the broker.
+
+--dry-run does not contact the broker and writes nothing to the log. It also works
+before a broker is configured, to see what the machine would send; the password
+is never printed, only whether one is stored.
+
+The work is done by the installed restic-backup.sh (--publish, --publish --dry-run),
+so this command reports exactly what a scheduled run would send. A machine whose
+restic-backup.sh predates it says so: re-run setup-restic-backup.sh --update.
+
+Exit codes: 0 sent (or previewed), 1 the broker did not accept it, 2 Home
+Assistant is not configured.
+T_EOF
+        ;;
+    unpublish) cat <<'T_EOF'
+restic-ctl unpublish - remove this machine from Home Assistant.
+
+  sudo restic-ctl unpublish             remove it now
+  sudo restic-ctl unpublish --dry-run   print the two topics it would clear
+
+Sends an empty retained message to both topics publish uses. Home Assistant removes
+the device and its entities, and the broker forgets the last state.
+
+The next backup announces the machine again. To retire it, stop the timer first,
+then unpublish:
+
+  sudo systemctl disable --now restic-backup.timer
+  sudo restic-ctl unpublish
+
+A machine that no longer exists can be removed from Home Assistant itself:
+Settings > Devices & services > MQTT > the device > Delete.
+
+Exit codes: 0 removed (or previewed), 1 the broker did not accept it, 2 Home
+Assistant is not configured.
+T_EOF
+        ;;
     find) cat <<'T_EOF'
 restic-ctl find - which snapshots contain a given path.
 
@@ -402,7 +462,7 @@ T_EOF
     '') usage ;;
     *)
         echo "No help topic '$1'." >&2
-        echo 'Topics: status snapshots run check schedule history log config exec forget restore unlock ls find' >&2
+        echo 'Topics: status snapshots run check schedule history log config publish unpublish exec forget restore unlock ls find' >&2
         return 2 ;;
     esac
 }
@@ -410,7 +470,7 @@ T_EOF
 CMD_GIVEN=0
 [ $# -gt 0 ] && case "$1" in
     status|snapshots|run|check|schedule|history|log|config) CMD="$1"; CMD_GIVEN=1; shift ;;
-    exec|forget|restore|unlock|ls|find)                     CMD="$1"; CMD_GIVEN=1; shift ;;
+    exec|forget|restore|unlock|ls|find|publish|unpublish)   CMD="$1"; CMD_GIVEN=1; shift ;;
     help)      CMD='help'; CMD_GIVEN=1; shift ;;
     -h|--help) usage; exit 0 ;;
 esac
@@ -440,6 +500,9 @@ while [ $# -gt 0 ]; do
         *)
             case "$CMD" in
                 exec|forget|restore|ls|find|help|schedule) REST="$REST $1"; shift ;;
+                publish|unpublish)
+                    [ "$1" = '--dry-run' ] || { echo "unknown option: $1" >&2; exit 2; }
+                    PUB_DRY=1; shift ;;
                 *) echo "unknown option: $1" >&2; exit 2 ;;
             esac ;;
     esac
@@ -1374,6 +1437,65 @@ cmd_find() {
     printf '\n'
 }
 
+# ============================================================== publish
+
+# Delegates to the installed backup script rather than carrying a second copy of the
+# MQTT code: what this sends, or previews, is by construction what the scheduled run
+# sends. Serves both publish and unpublish.
+cmd_publish() {
+    script='/usr/local/bin/restic-backup.sh'
+    [ -x "$script" ] || { fail "$script not found - run setup-restic-backup.sh"; exit 1; }
+    if [ "$CMD" = 'unpublish' ]; then
+        flag='--unpublish'; want='--unpublish'
+    else
+        # Discovery came after --publish: a script that has --publish but no
+        # discovery would report success while Home Assistant shows no device.
+        flag='--publish'; want='DISCOVERY_PREFIX'
+    fi
+    if ! grep -q -- "$want" "$script"; then
+        fail 'the installed restic-backup.sh predates this command'
+        info 'Bring it up to date:  sudo ./setup-restic-backup.sh --update'
+        info "(run the copy you brought, or $(cfg paths.tools)/setup-restic-backup.sh)"
+        printf '\n'; exit 1
+    fi
+
+    if [ "$PUB_DRY" = 1 ]; then
+        if [ "$CMD" = 'unpublish' ]; then
+            head_ 'Home Assistant removal (dry run, nothing sent)'
+        else
+            head_ 'Home Assistant messages (dry run, nothing sent)'
+        fi
+        out="$("$script" "$flag" --dry-run 2>&1)"; rc=$?
+        # The first lines are "Label  value" (two or more spaces between them, the
+        # label may itself contain one); the JSON after them is shown as-is.
+        printf '%s\n' "$out" | while IFS= read -r line; do
+            case "$line" in
+                [A-Z]*'  '*)
+                    label="${line%%  *}"
+                    value="$(printf '%s' "${line#"$label"}" | sed 's/^ *//')"
+                    field "$label" "$value" ;;
+                *)  printf '    %s\n' "$line" ;;
+            esac
+        done
+        printf '\n'
+        exit "$rc"
+    fi
+
+    head_ 'Home Assistant'
+    out="$("$script" "$flag" 2>&1)"; rc=$?
+    case "$rc" in
+        0) ok "$out"
+           [ "$CMD" = 'unpublish' ] && \
+               info 'The next backup announces it again. To retire the machine, first: sudo systemctl disable --now restic-backup.timer' ;;
+        2) field 'State' 'not configured' "$C_DIM"
+           info 'Enable it with: sudo ./setup-restic-backup.sh --only 3 --ha-host <broker> --ha-user <user>' ;;
+        *) fail "$out"
+           info 'Details in the log:  sudo restic-ctl log | grep "ha:"' ;;
+    esac
+    printf '\n'
+    exit "$rc"
+}
+
 # ============================================================== dispatch
 
 case "$CMD" in
@@ -1391,4 +1513,5 @@ case "$CMD" in
     unlock)    cmd_unlock ;;
     ls)        cmd_ls ;;
     find)      cmd_find ;;
+    publish|unpublish) cmd_publish ;;
 esac

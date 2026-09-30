@@ -786,10 +786,16 @@ Written and syntax-checked, but not yet exercised against the real NAS:
 - **Home Assistant reporting.** The Linux publisher was tested end to end — ok, failed
   backup, failed prune, dry run, bad password, broker down, a config.json without the
   section — but against a minimal MQTT broker written for the test, not against
-  Mosquitto. The Windows publisher is a port of the same logic that has only been
-  checked statically: no PowerShell was available. On each platform, the first
-  `-Only 3` / `--only 3` with the HA options is the real test: step 3 sends a message
-  and prints the broker's answer
+  Mosquitto. The same broker checked discovery on both platforms: two retained QoS 1
+  messages in order, discovery first, byte-identical discovery payloads from Linux and
+  Windows for the same box, and `unpublish` clearing both. The Windows side ran under
+  PowerShell 7 on Linux, not 5.1 on Windows, and `restic-ctl publish` / `unpublish`
+  through a shim standing in for `powershell.exe`.
+  **Not yet seen:** Home Assistant actually creating the device from the discovery
+  message, and the fleet template and automation in `HOME-ASSISTANT.md`, which were
+  written but never loaded into Home Assistant. On each platform, the first `-Only 3` /
+  `--only 3` with the HA options is the real test: step 3 sends the messages and prints
+  the broker's answer, and the device should then appear under MQTT
 - no **restore** has been verified on any machine. This is the real gap, not a detail:
   a backup that has never been restored from is a hypothesis. `restic-ctl help restore`
   lists three ways to test one without needing free disk space
