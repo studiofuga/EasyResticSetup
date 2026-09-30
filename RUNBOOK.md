@@ -783,25 +783,19 @@ Written and syntax-checked, but not yet exercised against the real NAS:
   `Register-ScheduledTask` and `systemctl daemon-reload` actually taking the new value.
   Run `restic-ctl schedule` with no argument afterwards: it reports both sides and says
   whether they agree, which is exactly the check
-- **Home Assistant reporting.** The Linux publisher was tested end to end — ok, failed
-  backup, failed prune, dry run, bad password, broker down, a config.json without the
-  section — but against a minimal MQTT broker written for the test, not against
-  Mosquitto. The same broker checked discovery on both platforms: two retained QoS 1
-  messages in order, discovery first, byte-identical discovery payloads from Linux and
-  Windows for the same box, and `unpublish` clearing both. The Windows side ran under
-  PowerShell 7 on Linux, not 5.1 on Windows, and `restic-ctl publish` / `unpublish`
-  through a shim standing in for `powershell.exe`.
-  **Seen for real, 2026-09-30:** `restic-ctl publish` on a Windows machine, through
-  Windows PowerShell 5.1, against the Mosquitto add-on: the message reached Home
-  Assistant. A wrong broker address fails with the OS's "connection refused" in the
-  log, before any credentials are sent - not with an authentication error.
-  **Not yet seen:** Home Assistant creating the device from the discovery message, a
-  Linux machine against the real broker, and the fleet template and automation in
-  `HOME-ASSISTANT.md` inside Home Assistant. The template's logic was run with
-  Home Assistant's functions stubbed out (a stale machine, a failed one, one that never
-  ran, one fine: three flagged), and the package parses as YAML and Jinja - but that is
-  not Home Assistant. *Checking that it sees the machines* in `HOME-ASSISTANT.md` is the
-  real test
+- **Home Assistant: the fleet template.** The reporting itself is verified: on
+  2026-09-30 a Windows machine (through Windows PowerShell 5.1) and a Linux one
+  published to the Mosquitto add-on, the state reached Home Assistant and discovery
+  created each device with its entities. Before that, a test broker had covered the
+  failure paths on both platforms - failed backup, failed prune, dry run, bad
+  password, broker down, `unpublish` - and byte-identical discovery payloads from
+  Linux and Windows. A wrong broker address fails with the OS's "connection refused"
+  in the log, before any credentials are sent, not with an authentication error.
+  **Not yet seen** is the fleet template and automation in `HOME-ASSISTANT.md` inside
+  Home Assistant. Their logic was run with Home Assistant's functions stubbed out (a
+  stale machine, a failed one, one that never ran, one fine: three flagged), and the
+  package parses as YAML and Jinja - but that is not Home Assistant. *Checking that it
+  sees the machines* in `HOME-ASSISTANT.md` is the real test
 - no **restore** has been verified on any machine. This is the real gap, not a detail:
   a backup that has never been restored from is a hypothesis. `restic-ctl help restore`
   lists three ways to test one without needing free disk space
