@@ -131,66 +131,122 @@ mosquitto_sub -h <broker> -u <user> -P <password> -v -t 'restic/#' -t 'homeassis
 The devices need nothing. What a retained message cannot tell you is that a machine
 has **stopped** backing up: its last `ok` stays `ok` forever. One template sensor
 covers that for every machine, including the ones added later, by looking at each
-*Last run* and each *Problem*:
+*Last run* and each *Problem*; one automation turns it into a notification.
 
-```yaml
-template:
-  - sensor:
-      - name: "Restic attention"
-        unique_id: restic_attention
-        icon: mdi:backup-restore
-        # How many machines need a look; the list is in the "machines" attribute.
-        state: >
-          {% set ns = namespace(n=0) %}
-          {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
-            {% set t = states(e) | as_datetime(none) %}
-            {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
-            {% if t is none or now() - t > timedelta(hours=36) or is_state(p, 'on') %}
-              {% set ns.n = ns.n + 1 %}
-            {% endif %}
-          {% endfor %}
-          {{ ns.n }}
-        attributes:
-          machines: >
-            {% set ns = namespace(l=[]) %}
-            {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
-              {% set t = states(e) | as_datetime(none) %}
-              {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
-              {% set o = states(e | replace('_last_run', '_outcome')) %}
-              {% if t is none or now() - t > timedelta(hours=36) %}
-                {% set ns.l = ns.l + [device_attr(e, 'name') ~ ': no run in 36 h (' ~ o ~ ')'] %}
-              {% elif is_state(p, 'on') %}
-                {% set ns.l = ns.l + [device_attr(e, 'name') ~ ': ' ~ o] %}
-              {% endif %}
-            {% endfor %}
-            {{ ns.l }}
+Both go in a single package file, not in `configuration.yaml` itself. The default
+`configuration.yaml` already has `automation: !include automations.yaml`, and often a
+`template:` key too; a second key of the same name in that file is a duplicate, not a
+merge. Keys in a package merge with the rest of the configuration. The Template
+helper in the UI is not an alternative: it has no attributes, and the list of
+machines lives in one.
+
+### Installing it
+
+1. **Enable packages**, once. In `configuration.yaml`:
+
+   ```yaml
+   homeassistant:
+     packages: !include_dir_named packages
+   ```
+
+   If there is already a `homeassistant:` key, add the `packages:` line under it
+   instead of a second `homeassistant:`. Then create a `packages` folder next to
+   `configuration.yaml`, with the File editor or Studio Code Server add-on, or over
+   the Samba share.
+
+2. **Create `packages/restic.yaml`** with this content:
+
+   ```yaml
+   template:
+     - sensor:
+         - name: "Restic attention"
+           unique_id: restic_attention
+           icon: mdi:backup-restore
+           # How many machines need a look; the list is in the "machines" attribute.
+           state: >
+             {% set ns = namespace(n=0) %}
+             {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
+               {% set t = states(e) | as_datetime(none) %}
+               {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
+               {% if t is none or now() - t > timedelta(hours=36) or is_state(p, 'on') %}
+                 {% set ns.n = ns.n + 1 %}
+               {% endif %}
+             {% endfor %}
+             {{ ns.n }}
+           attributes:
+             machines: >
+               {% set ns = namespace(l=[]) %}
+               {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
+                 {% set t = states(e) | as_datetime(none) %}
+                 {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
+                 {% set o = states(e | replace('_last_run', '_outcome')) %}
+                 {% if t is none or now() - t > timedelta(hours=36) %}
+                   {% set ns.l = ns.l + [device_attr(e, 'name') ~ ': no run in 36 h (' ~ o ~ ')'] %}
+                 {% elif is_state(p, 'on') %}
+                   {% set ns.l = ns.l + [device_attr(e, 'name') ~ ': ' ~ o] %}
+                 {% endif %}
+               {% endfor %}
+               {{ ns.l }}
+
+   automation:
+     - id: restic_attention_notify
+       alias: "Restic: a machine needs attention"
+       triggers:
+         - trigger: state
+           entity_id: sensor.restic_attention
+       conditions:
+         - condition: template
+           value_template: >
+             {{ trigger.to_state.state | int(0) > trigger.from_state.state | int(0) }}
+       actions:
+         - action: notify.notify
+           data:
+             title: "Backups"
+             message: "{{ state_attr('sensor.restic_attention', 'machines') | join('\n') }}"
+   ```
+
+3. **Point the notification at a real target.** `notify.notify` exists only on some
+   setups. The usual one is the companion app, `notify.mobile_app_<phone>`: find the
+   exact name in Developer tools > Actions by typing `notify.`.
+
+4. **Check, then restart.** Developer tools > YAML > *Check configuration*, then
+   restart Home Assistant. The restart is needed once, for the `packages:` line. Later
+   edits to `restic.yaml` only need *Template entities* and *Automations* reloaded,
+   from the same page.
+
+The `triggers:` / `actions:` / `trigger: state` spelling is Home Assistant 2024.10 and
+later. An older installation wants `trigger:` / `platform: state` / `action:` /
+`service:` instead.
+
+### Checking that it sees the machines
+
+**Do this once after installing, and again after adding a machine.** If the pattern
+matches nothing, the sensor reads `0` forever, which looks exactly like "every backup
+is fine". In Developer tools > Template:
+
 ```
+{{ integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') | list }}
+```
+
+It should list one `sensor.restic_<name>_last_run` per machine that has published.
+An empty list means the entity ids are not what the template expects: see *Names*
+above, and check the device under Settings > Devices & services > MQTT.
+
+Then in Developer tools > States, `sensor.restic_attention` should hold a number, with
+the offending machines in its `machines` attribute. To test the notification without
+waiting for a failure: Settings > Automations > *Restic: a machine needs attention*
+> ⋮ > *Run actions*. It sends the current list, possibly empty, which is enough to
+prove the target works.
+
+### Tuning
 
 36 hours is one missed daily run plus margin. A machine that is often off for a day
-or two will show up here; raise it, or accept that as the point.
+or two will show up here; raise it (three places in the template: the two
+`timedelta(hours=36)` and the `36 h` in the message), or accept that as the point.
 
-And a notification when the count goes up:
-
-```yaml
-automation:
-  - alias: "Restic: a machine needs attention"
-    triggers:
-      - trigger: state
-        entity_id: sensor.restic_attention
-    conditions:
-      - condition: template
-        value_template: >
-          {{ trigger.to_state.state | int(0) > trigger.from_state.state | int(0) }}
-    actions:
-      - action: notify.notify
-        data:
-          title: "Backups"
-          message: "{{ state_attr('sensor.restic_attention', 'machines') | join('\n') }}"
-```
-
-Both rely on the entity ids Home Assistant generated, `sensor.restic_<name>_last_run`
-and so on. Renaming a device in the UI does not change them, but renaming its entity
-ids does, and a renamed machine then drops out of both.
+Both the sensor and the automation rely on the entity ids Home Assistant generated,
+`sensor.restic_<name>_last_run` and so on. Renaming a device in the UI does not change
+them, but renaming its entity ids does, and a renamed machine then drops out of both.
 
 ## Retiring a machine
 
