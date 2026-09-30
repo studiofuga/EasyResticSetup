@@ -510,6 +510,45 @@ exactly what to run on the NAS; then you re-run the installer and it continues.
 | `-BackupPath <p>[,<p>]` | `--backup-paths "A B"` | Windows: the user profile · Linux: `/home /etc` | |
 | `-HostAlias <name>` | `--host-alias NAME` | `nas-restic` | the `Host` entry in `ssh/config`, and the first half of the repository string |
 
+### Home Assistant reporting (optional, any run)
+
+After every backup the outcome is published over MQTT, **retained**, to the broker Home
+Assistant uses. Off until an HA host is given; stored in `config.json` like everything
+else, so it is typed once.
+
+| Windows | Linux | Default | Notes |
+|---|---|---|---|
+| `-HaHost <host>` | `--ha-host HOST` | none — off | MQTT broker address. `''` turns reporting off again |
+| `-HaPort <n>` | `--ha-port PORT` | 1883 | |
+| `-HaUser <user>` | `--ha-user USER` | none | MQTT account for this machine |
+| `-HaPasswordFile <f>` | `--ha-password-file FILE` | — | read the MQTT password from the file once and store it as `mqtt-password` beside the repository password. Without it an interactive run asks with hidden input, so the password never appears on a command line |
+| `-HaBox <name>` | `--ha-box NAME` | the NAS user | this machine's name in Home Assistant |
+| `-HaTopic <topic>` | `--ha-topic TOPIC` | `restic/<box>` | state topic. No leading slash: MQTT would treat it as an empty first level |
+
+Step 3 sends a test message and reports the broker's answer, so switching a machine that
+is already set up is a single step:
+
+```
+.\Setup-ResticBackup.ps1 -Only 3 -HaHost <broker> -HaUser <mqtt-user>
+sudo ./setup-restic-backup.sh --only 3 --ha-host <broker> --ha-user <mqtt-user>
+```
+
+The message is the content of `last-run.json` plus `box` and `publishedAt`. On a machine
+that has never run a backup, `outcome` is `never`. It is sent after every real run —
+success, failure, or failed prune — and never after a dry run. A broker that is down or
+refuses the login is logged (`ha: publish FAILED: …`) and changes nothing about the
+backup's own result or exit code.
+
+```json
+{"startedAt": "...", "finishedAt": "...", "durationSec": 812, "outcome": "ok",
+ "exitCode": 0, "host": "...", "runAs": "root", "snapshotId": "...",
+ "filesNew": 3, "filesChanged": 12, "dataAddedBytes": 1234567,
+ "filesProcessed": 2868685, "bytesProcessed": 363889000000,
+ "box": "restic-<machine>", "publishedAt": "2026-09-30T04:13:27+02:00"}
+```
+
+`outcome` is one of `ok`, `warnings`, `failed`, `prune-failed`, `never`.
+
 > **`home` vs `homes`.** `home` (singular) is DSM's per-user alias for the logged-in
 > account's own home and needs no permission on any shared folder. `homes` (plural) is
 > the shared folder holding everyone's homes, and reaching a repository through
@@ -583,11 +622,17 @@ that actually matters.
 .\restic-backup.ps1 -Init      one-time: create the repository
 .\restic-backup.ps1 -Help
 
+.\restic-backup.ps1 -Publish   re-send last-run.json to Home Assistant, no backup
+
 restic-backup.sh               normal run (what the service does)
 restic-backup.sh --dry-run
 restic-backup.sh --init
+restic-backup.sh --publish
 restic-backup.sh --help
 ```
+
+`-Publish` / `--publish` exits 0 when the broker confirmed the message, 1 when it did
+not (the reason is printed and logged), 2 when Home Assistant is not configured.
 
 It reads everything from `config.json` and writes the log, `progress.json`,
 `last-run.json` and `history.jsonl`. On Windows it uses `--use-fs-snapshot` (VSS), which
@@ -672,6 +717,8 @@ site-specific lives.
   "backupPaths": [ "C:\\Users\\someone" ],
   "retention": { "daily": 14, "weekly": 8, "monthly": 12 },
   "schedule": { "time": "03:30", "timeLimitHours": 20, "wakeToRun": false },
+  "homeAssistant": { "host": "ha.example.lan", "port": 1883, "user": "restic-machinename",
+                     "topic": "", "box": "" },
   "paths": { "base": "C:\\ProgramData\\restic", "tools": "C:\\Program Files\\restic-backup" }
 }
 ```
@@ -684,6 +731,7 @@ site-specific lives.
 | `schedule.time`, `schedule.timeLimitHours`, `schedule.wakeToRun` | `restic-ctl schedule`, then step 8 | step 8 (Windows) |
 | `schedule.onCalendar`, `schedule.retryCalendar` | `restic-ctl schedule`, then step 8 | step 8 (Linux) |
 | `paths.base`, `paths.tools` | the installer | `restic-ctl schedule`, to find the installer |
+| `homeAssistant.*` | the installer (`-Ha*` / `--ha-*`) | the backup script, `restic-ctl config`. Empty `host` means off; empty `box` and `topic` are composed at run time. The MQTT password is **not** here: it is in `mqtt-password`, locked like the repository password |
 
 `paths.tools` is the **tools** directory, not the `PATH` directory: on Linux
 `/usr/local/lib/restic-backup`, while `/usr/local/bin` only holds the `restic-ctl` and

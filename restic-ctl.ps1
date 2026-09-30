@@ -1133,12 +1133,24 @@ function Show-Config {
     Write-Field 'Backup paths'  ($Settings.BackupPaths -join '; ')
     Write-Field 'Retention'     ("{0} daily, {1} weekly, {2} monthly" -f `
         $Settings.Retention.Daily, $Settings.Retention.Weekly, $Settings.Retention.Monthly)
+    $ha = $Config.homeAssistant
+    if ($ha -and $ha.host) {
+        $haBox   = if ($ha.box)   { $ha.box }   else { $Config.nas.user }
+        $haTopic = if ($ha.topic) { $ha.topic } else { "restic/$haBox" }
+        $haUser  = if ($ha.user)  { $ha.user }  else { '<no user>' }
+        $haPort  = if ($ha.port)  { $ha.port }  else { 1883 }
+        Write-Field 'Home Assistant' ("{0}@{1}:{2}" -f $haUser, $ha.host, $haPort)
+        Write-Field 'HA box/topic'   ("{0}  ->  {1}" -f $haBox, $haTopic)
+    } else {
+        Write-Field 'Home Assistant' 'not configured' 'DarkGray'
+    }
 
     Write-Head 'Files'
     foreach ($f in @(
         @('Log',        $LogFile),
         @('Excludes',   (Join-Path $Base 'excludes.txt')),
         @('Password',   $PasswordFile),
+        @('MQTT password', (Join-Path $Base 'mqtt-password')),
         @('Last run',   $LastRunFile),
         @('History',    $HistoryFile),
         @('Progress',   $ProgressFile)

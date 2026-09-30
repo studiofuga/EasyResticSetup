@@ -46,6 +46,27 @@
     Default nas-restic. Machines set up earlier may use another alias; it is read
     back from config.json, so it never has to be retyped.
 
+.PARAMETER HaHost
+    Home Assistant's MQTT broker. When set, every backup publishes its outcome there,
+    retained. -HaHost '' turns reporting off. Stored in config.json like the rest.
+
+.PARAMETER HaPort
+    MQTT port. Default 1883.
+
+.PARAMETER HaUser
+    MQTT account for this machine.
+
+.PARAMETER HaPasswordFile
+    Read the MQTT password from this file once and store it, ACL-locked, as
+    C:\ProgramData\restic\mqtt-password. Without it an interactive run asks, so the
+    password never appears on a command line or in the shell history.
+
+.PARAMETER HaBox
+    This machine's name in Home Assistant. Default: the NAS user.
+
+.PARAMETER HaTopic
+    State topic. Default: restic/<box>.
+
 .PARAMETER Base
     Configuration directory. Default C:\ProgramData\restic.
 
@@ -143,6 +164,13 @@ param(
     [string]   $ToolsDir    = 'C:\Program Files\restic-backup',
     [string]   $HostAlias   = 'nas-restic',
     [string]   $TaskName    = 'restic-backup',
+    # Home Assistant reporting over MQTT; off until -HaHost is given.
+    [string]   $HaHost      = '',
+    [int]      $HaPort      = 1883,
+    [string]   $HaUser      = '',
+    [string]   $HaTopic     = '',
+    [string]   $HaBox       = '',
+    [string]   $HaPasswordFile = '',
     [int]      $From        = 1,
     [int]      $Only        = 0,
     [switch]   $SkipTask,
@@ -168,7 +196,7 @@ $ErrorActionPreference = 'Stop'
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-$ScriptVersion = '2026.09.27.2'
+$ScriptVersion = '2026.09.30.2'
 
 # Which parameters the caller actually typed, as opposed to the ones that fell back
 # to a default. This is the whole basis of the configuration handling below: a
@@ -223,6 +251,21 @@ WHAT TO PASS ON A FIRST RUN
                         an afternoon - do not change it without reason.
   -BackupPath <p>[,<p>] what to back up (default: the current user's profile)
   -HostAlias <name>     the Host entry written into ssh\config (default nas-restic)
+
+HOME ASSISTANT (optional, any run)
+  After every backup the outcome is published over MQTT, retained, to the broker
+  Home Assistant uses. Off until -HaHost is given; stored like everything else.
+  -HaHost <host>        MQTT broker address. -HaHost '' turns reporting off
+  -HaPort <n>           MQTT port (default 1883)
+  -HaUser <user>        MQTT account for this machine
+  -HaPasswordFile <f>   read the MQTT password from <f> once and store it in
+                        C:\ProgramData\restic\mqtt-password. Without it an
+                        interactive run asks, so the password never appears on a
+                        command line
+  -HaBox <name>         this machine's name in Home Assistant (default: NAS user)
+  -HaTopic <topic>      state topic (default: restic/<box>)
+  Step 3 sends a test message, so "-Only 3 -HaHost ..." is enough to switch it on
+  for a machine already set up.
 
 OPTIONS
   -From <n>             start at step n
@@ -309,6 +352,7 @@ $KeyFile      = Join-Path $SshDir 'id_ed25519'
 $SshConfig    = Join-Path $SshDir 'config'
 $KnownHosts   = Join-Path $SshDir 'known_hosts'
 $PasswordFile = Join-Path $Base 'password'
+$HaPasswordStore = Join-Path $Base 'mqtt-password'
 $ConfigFile   = Join-Path $Base 'config.json'
 $LegacyPsd1   = Join-Path $Base 'settings.psd1'
 $ExcludeFile  = Join-Path $Base 'excludes.txt'
@@ -377,6 +421,14 @@ if ($Stored) {
     if (-not (Was-Given 'HostAlias')      -and $Stored.nas.hostAlias)        { $HostAlias = $Stored.nas.hostAlias }
     if (-not (Was-Given 'RepoPath')       -and $Stored.nas.repoPath)         { $RepoPath  = $Stored.nas.repoPath }
     if (-not (Was-Given 'BackupPath')     -and $Stored.backupPaths)          { $BackupPath = @($Stored.backupPaths) }
+    if ($Stored.homeAssistant) {
+        $ha = $Stored.homeAssistant
+        if (-not (Was-Given 'HaHost')  -and $ha.host)  { $HaHost  = "$($ha.host)" }
+        if (-not (Was-Given 'HaPort')  -and $ha.port)  { $HaPort  = [int]$ha.port }
+        if (-not (Was-Given 'HaUser')  -and $ha.user)  { $HaUser  = "$($ha.user)" }
+        if (-not (Was-Given 'HaTopic') -and $ha.topic) { $HaTopic = "$($ha.topic)" }
+        if (-not (Was-Given 'HaBox')   -and $ha.box)   { $HaBox   = "$($ha.box)" }
+    }
     # The schedule has no command-line override at all any more, so it is simply
     # whatever config.json says. restic-ctl schedule is what writes it.
     if ($Stored.schedule) {
@@ -822,6 +874,24 @@ Write-Info "Repository   $Repository"
 Write-Info "Local base   $Base"
 Write-Info "Tools        $ToolsDir"
 Write-Info "Backup paths $($BackupPath -join ', ')"
+if ($HaHost) {
+    $haBoxShown   = if ($HaBox) { $HaBox } else { $NasUser }
+    $haTopicShown = if ($HaTopic) { $HaTopic } else { "restic/$haBoxShown" }
+    $haUserShown  = if ($HaUser) { $HaUser } else { '<no user>' }
+    Write-Info "Home Asst.   $haUserShown@${HaHost}:$HaPort, box $haBoxShown, topic $haTopicShown"
+} else {
+    Write-Info 'Home Asst.   not configured (-HaHost to enable)'
+}
+if ($HaPasswordFile) {
+    if (-not (Test-Path $HaPasswordFile -PathType Leaf)) {
+        Write-Host ''
+        Write-Host "  -HaPasswordFile: cannot read $HaPasswordFile" -ForegroundColor Red
+        exit 2
+    }
+    # Absolute now: [System.IO.File] resolves relative paths against the process
+    # directory, which is not the PowerShell location the user typed it from.
+    $HaPasswordFile = (Resolve-Path $HaPasswordFile).Path
+}
 
 if ($MigratedFrom) {
     Write-Info "Config       migrated from $(Split-Path $MigratedFrom -Leaf)"
@@ -1013,6 +1083,15 @@ if (Should-Run 3) {
         backupPaths = @($BackupPath)
         retention   = [ordered]@{ daily = 14; weekly = 8; monthly = 12 }
         schedule    = [ordered]@{ time = $TaskTime; timeLimitHours = $TimeLimitHours; wakeToRun = $WakeTask }
+        # Empty topic and box are composed by the backup script (box = NAS user,
+        # topic = restic/<box>), so only what was chosen on purpose is stored.
+        homeAssistant = [ordered]@{
+            host  = $HaHost
+            port  = $HaPort
+            user  = $HaUser
+            topic = $HaTopic
+            box   = $HaBox
+        }
         paths       = [ordered]@{ base = $Base; tools = $ToolsDir }
     }
     if ($Stored -and $Stored.retention) {
@@ -1201,6 +1280,7 @@ target
     .\restic-backup.ps1            normal run (what the scheduled task does)
     .\restic-backup.ps1 -DryRun    list what would be backed up, no upload, no prune
     .\restic-backup.ps1 -Init      one-time: create the repository
+    .\restic-backup.ps1 -Publish   re-send last-run.json to Home Assistant, no backup
     .\restic-backup.ps1 -Help      this text
 
   Prefer "restic-ctl run" over calling this by hand: it goes through the scheduler,
@@ -1210,6 +1290,7 @@ target
 param(
     [switch]$Init,
     [switch]$DryRun,
+    [switch]$Publish,
     [switch]$Help
 )
 
@@ -1220,6 +1301,7 @@ if ($Help) {
     Write-Host '    .\restic-backup.ps1            normal run (what the scheduled task does)'
     Write-Host '    .\restic-backup.ps1 -DryRun    list what would be backed up, no upload, no prune'
     Write-Host '    .\restic-backup.ps1 -Init      one-time: create the repository'
+    Write-Host '    .\restic-backup.ps1 -Publish   re-send last-run.json to Home Assistant'
     Write-Host ''
     Write-Host '  Reads everything from config.json in this folder: paths, retention,'
     Write-Host '  the NAS alias. Writes the log, progress.json, last-run.json and'
@@ -1262,6 +1344,22 @@ $KeepArgs   = @('--keep-daily',   "$($Config.retention.daily)",
                 '--keep-weekly',  "$($Config.retention.weekly)",
                 '--keep-monthly', "$($Config.retention.monthly)")
 
+# Home Assistant reporting. Empty host = off, and a config.json written before the
+# section existed simply has none. Box and topic are composed when not set, for the
+# same reason as the repository string above.
+$Ha = $Config.homeAssistant
+$HaHost = ''; $HaPort = 1883; $HaUser = ''; $HaBox = ''; $HaTopic = ''
+if ($Ha) {
+    if ($Ha.host)  { $HaHost  = "$($Ha.host)" }
+    if ($Ha.port)  { $HaPort  = [int]$Ha.port }
+    if ($Ha.user)  { $HaUser  = "$($Ha.user)" }
+    if ($Ha.box)   { $HaBox   = "$($Ha.box)" }
+    if ($Ha.topic) { $HaTopic = "$($Ha.topic)" }
+}
+if (-not $HaBox)   { $HaBox   = "$($Config.nas.user)" }
+if (-not $HaTopic) { $HaTopic = "restic/$HaBox" }
+$HaPasswordFile = Join-Path $Base 'mqtt-password'
+
 New-Item -ItemType Directory -Force -Path (Split-Path $LogFile) | Out-Null
 if ((Test-Path $LogFile) -and ((Get-Item $LogFile).Length -gt 10MB)) {
     Move-Item $LogFile "$LogFile.old" -Force
@@ -1289,6 +1387,173 @@ function Add-History($Object) {
         $lines[($lines.Count - 500)..($lines.Count - 1)] |
             Set-Content $HistoryFile -Encoding utf8
     }
+}
+
+# ---- Home Assistant over MQTT ------------------------------------------------------
+# Publishes last-run.json to Home Assistant's MQTT broker, retained, so HA shows the
+# latest outcome even after it restarts. Plain MQTT 3.1.1 over a TcpClient: no MQTT
+# client to install on every machine, and the password is read from its locked file
+# here instead of passing through a command line.
+#
+# Never allowed to change the backup's own result: a broker that is down is logged and
+# the run exits exactly as it would have without it. Kept to Windows PowerShell 5.1,
+# which is what the scheduled task runs.
+function Add-MqttString([System.IO.MemoryStream]$Buffer, [string]$Text) {
+    $b = [System.Text.Encoding]::UTF8.GetBytes($Text)
+    $Buffer.WriteByte([byte](($b.Length -shr 8) -band 0xFF))
+    $Buffer.WriteByte([byte]($b.Length -band 0xFF))
+    $Buffer.Write($b, 0, $b.Length)
+}
+
+function Send-MqttPacket($Stream, [int]$Kind, [byte[]]$Body) {
+    $m = New-Object System.IO.MemoryStream
+    $m.WriteByte([byte]$Kind)
+    $n = $Body.Length
+    do {
+        $digit = $n % 128
+        $n = [int][math]::Floor($n / 128)
+        if ($n -gt 0) { $digit = $digit -bor 0x80 }
+        $m.WriteByte([byte]$digit)
+    } while ($n -gt 0)
+    $m.Write($Body, 0, $Body.Length)
+    $bytes = $m.ToArray()
+    $Stream.Write($bytes, 0, $bytes.Length)
+    $Stream.Flush()
+}
+
+function Read-Exact($Stream, [int]$Count) {
+    $buf = New-Object byte[] $Count
+    $off = 0
+    while ($off -lt $Count) {
+        $r = $Stream.Read($buf, $off, $Count - $off)
+        if ($r -le 0) { throw 'broker closed the connection' }
+        $off += $r
+    }
+    return ,$buf
+}
+
+function Read-MqttPacket($Stream) {
+    $kind = (Read-Exact $Stream 1)[0]
+    $length = 0; $mult = 1
+    while ($true) {
+        $digit = (Read-Exact $Stream 1)[0]
+        $length += ($digit -band 0x7F) * $mult
+        if (-not ($digit -band 0x80)) { break }
+        $mult *= 128
+    }
+    $body = if ($length -gt 0) { Read-Exact $Stream $length } else { ,(New-Object byte[] 0) }
+    return @{ Kind = [int]$kind; Body = [byte[]]$body }
+}
+
+# Returns 0 or 1 and leaves a one-line result in $script:HaMessage, so the value the
+# function returns is never mixed with text on the output pipeline.
+function Send-HaStatus {
+    $script:HaMessage = ''
+    if (-not $HaHost) { return 0 }
+    $client = $null
+    try {
+        if (-not $HaTopic -or $HaTopic.Contains('+') -or $HaTopic.Contains('#')) {
+            throw "invalid topic '$HaTopic'"
+        }
+        $record = $null
+        if (Test-Path $LastRunFile) {
+            try { $record = Get-Content $LastRunFile -Raw | ConvertFrom-Json } catch { $record = $null }
+        }
+        # Nothing has run yet. Said explicitly rather than sending nothing, so HA can
+        # tell a machine that never backed up from one that is not reporting.
+        if (-not $record) { $record = [pscustomobject]@{ outcome = 'never'; host = $env:COMPUTERNAME } }
+        $record | Add-Member -NotePropertyName box -NotePropertyValue $HaBox -Force
+        $record | Add-Member -NotePropertyName publishedAt `
+                             -NotePropertyValue (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz') -Force
+        $payload = [System.Text.Encoding]::UTF8.GetBytes(($record | ConvertTo-Json -Depth 6 -Compress))
+
+        $password = ''
+        if (Test-Path $HaPasswordFile) {
+            $password = ([System.IO.File]::ReadAllText($HaPasswordFile)).Trim("`r", "`n")
+        }
+
+        # 23 characters is the longest client id MQTT 3.1.1 obliges a broker to accept.
+        # The box usually is the NAS account, restic-<host>, so the prefix is not doubled.
+        $cid = $HaBox -replace '[^A-Za-z0-9_-]', ''
+        if (-not $cid.StartsWith('restic')) { $cid = "restic-$cid" }
+        if ($cid.Length -gt 23) { $cid = $cid.Substring(0, 23) }
+
+        $flags = 0x02                                    # clean session
+        $connect = New-Object System.IO.MemoryStream
+        Add-MqttString $connect 'MQTT'
+        $connect.WriteByte(4)                            # protocol level 3.1.1
+        $tail = New-Object System.IO.MemoryStream
+        Add-MqttString $tail $cid
+        if ($HaUser) {
+            $flags = $flags -bor 0x80
+            Add-MqttString $tail $HaUser
+            if ($password) {                             # 3.1.1: no password without a user
+                $flags = $flags -bor 0x40
+                Add-MqttString $tail $password
+            }
+        }
+        $connect.WriteByte([byte]$flags)
+        $connect.WriteByte(0); $connect.WriteByte(30)    # keep-alive, seconds
+        $t = $tail.ToArray(); $connect.Write($t, 0, $t.Length)
+
+        $client = New-Object System.Net.Sockets.TcpClient
+        $pending = $client.BeginConnect($HaHost, $HaPort, $null, $null)
+        if (-not $pending.AsyncWaitHandle.WaitOne(15000)) { throw "no answer from ${HaHost}:$HaPort" }
+        $client.EndConnect($pending)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = 15000; $stream.WriteTimeout = 15000
+
+        Send-MqttPacket $stream 0x10 $connect.ToArray()
+        $reply = Read-MqttPacket $stream
+        if ($reply.Kind -ne 0x20 -or $reply.Body.Length -ne 2) {
+            throw ('unexpected reply to CONNECT (0x{0:x2})' -f $reply.Kind)
+        }
+        $code = [int]$reply.Body[1]
+        if ($code -ne 0) {
+            $reasons = @{ 1 = 'protocol version refused'; 2 = 'client id refused'
+                          3 = 'server unavailable'; 4 = 'bad user name or password'
+                          5 = 'not authorized' }
+            if ($reasons.ContainsKey($code)) { throw $reasons[$code] }
+            throw "refused, code $code"
+        }
+
+        # QoS 1 + retain: the broker confirms it has the message, and keeps it.
+        $pub = New-Object System.IO.MemoryStream
+        Add-MqttString $pub $HaTopic
+        $pub.WriteByte(0); $pub.WriteByte(1)             # packet id 1
+        $pub.Write($payload, 0, $payload.Length)
+        Send-MqttPacket $stream 0x33 $pub.ToArray()
+        while ($true) {
+            $ack = Read-MqttPacket $stream
+            if ((($ack.Kind -band 0xF0) -eq 0x40) -and $ack.Body.Length -ge 2 -and
+                $ack.Body[0] -eq 0 -and $ack.Body[1] -eq 1) { break }
+        }
+        Send-MqttPacket $stream 0xE0 ([byte[]]@())
+
+        Write-Log "ha: published $($record.outcome) to $HaTopic on ${HaHost}:$HaPort"
+        $script:HaMessage = "published to $HaTopic on ${HaHost}:$HaPort"
+        return 0
+    } catch {
+        # .NET calls arrive wrapped ("Exception calling EndConnect ..."); the inner
+        # exception is the one that says what actually happened.
+        $e = $_.Exception
+        while ($e.InnerException) { $e = $e.InnerException }
+        Write-Log "ha: publish FAILED: $($e.Message)"
+        $script:HaMessage = "publish failed: $($e.Message)"
+        return 1
+    } finally {
+        if ($client) { $client.Close() }
+    }
+}
+
+if ($Publish) {
+    if (-not $HaHost) {
+        Write-Output "Home Assistant is not configured (no homeAssistant.host in $ConfigFile)."
+        exit 2
+    }
+    $rc = Send-HaStatus
+    Write-Output $script:HaMessage
+    exit $rc
 }
 
 function Invoke-Restic([string[]]$ResticArgs) {
@@ -1499,7 +1764,10 @@ if (-not $DryRun) {
     Add-History $record
 }
 
-if ($outcome -eq 'failed') { exit $rc }
+if ($outcome -eq 'failed') {
+    if (-not $DryRun) { $null = Send-HaStatus }
+    exit $rc
+}
 
 if (-not $DryRun) {
     $rc = Invoke-Restic (@('forget', '--prune') + $KeepArgs)
@@ -1508,8 +1776,10 @@ if (-not $DryRun) {
         $record.outcome       = 'prune-failed'
         $record.pruneExitCode = $rc
         Write-Json $LastRunFile $record
+        $null = Send-HaStatus
         exit $rc
     }
+    $null = Send-HaStatus
 }
 
 # Releasing the power request. Process exit would drop it anyway, so this is tidiness -
@@ -1523,6 +1793,51 @@ exit 0
     Write-Ok 'restic-backup.ps1'
 
     Set-StrictAcl $Base
+
+    # --- Home Assistant: the MQTT password and a test message ------------------
+    # The password gets its own locked file, like the repository password, rather than
+    # a field in config.json: config.json is shown by "restic-ctl config" and is the
+    # file people copy around when comparing machines.
+    if (-not $HaHost) {
+        Write-Info 'Home Assistant reporting off (-HaHost to enable)'
+    } else {
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        if ($HaPasswordFile) {
+            $pw = ([System.IO.File]::ReadAllText($HaPasswordFile)).Trim("`r", "`n")
+            [System.IO.File]::WriteAllText($HaPasswordStore, $pw, $utf8)
+            $pw = $null
+            Write-Ok "MQTT password stored in $HaPasswordStore"
+        } elseif (Test-Path $HaPasswordStore) {
+            Write-Info 'MQTT password already present, kept (-HaPasswordFile to replace)'
+        } elseif ($HaUser -and [Environment]::UserInteractive) {
+            $secure = Read-Host "    MQTT password for $HaUser (empty for none)" -AsSecureString
+            $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+            try { $pw = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+            finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+            if ($pw) {
+                [System.IO.File]::WriteAllText($HaPasswordStore, $pw, $utf8)
+                Write-Ok "MQTT password stored in $HaPasswordStore"
+            }
+            $pw = $null
+        } elseif ($HaUser) {
+            Write-Warn 'no MQTT password stored and no console to ask: pass -HaPasswordFile'
+        }
+        if (Test-Path $HaPasswordStore) { Set-StrictAcl $HaPasswordStore }
+
+        # Sent now rather than discovered wrong at 3 a.m.: a bad password or an
+        # unreachable broker shows here, while someone is looking. It republishes the
+        # last run, or "never" on a new machine - both true statements.
+        $out = Invoke-Native 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+                                                '-File', $BackupScript, '-Publish')
+        $msg = (@($out) | Where-Object { "$_".Trim() }) -join ' '
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "Home Assistant: $msg"
+        } else {
+            Write-Warn "Home Assistant: $msg"
+            Write-Info 'The backup itself is not affected; it only stops reporting. Fix it'
+            Write-Info "and re-run with -Only 3, or test with: $BackupScript -Publish"
+        }
+    }
 }
 
 # ====================================================== 4. key and repo password

@@ -30,7 +30,7 @@ set -u
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-SCRIPT_VERSION='2026.09.27.2'
+SCRIPT_VERSION='2026.09.30.2'
 
 # ---- defaults ---------------------------------------------------------------
 # No default on purpose: nothing site-specific is baked into this script. The NAS
@@ -52,6 +52,15 @@ KEEP_MONTHLY=12
 ON_CALENDAR='daily'
 # Second chance the same day, for a run that was interrupted or skipped on battery.
 RETRY_CALENDAR='*-*-* 19:17'
+# Home Assistant status reporting over MQTT. Off until an HA host is given; an empty
+# topic or box is composed at run time (box = NAS user, topic = restic/<box>), so
+# only what was chosen on purpose is stored.
+HA_HOST=''
+HA_PORT=1883
+HA_USER=''
+HA_TOPIC=''
+HA_BOX=''
+HA_PASSWORD_FROM=''               # --ha-password-file: read once, stored under $BASE
 FROM=1
 ONLY=0
 SKIP_TIMER=0
@@ -110,6 +119,21 @@ WHAT TO PASS ON A FIRST RUN
   --host-alias NAME   the Host entry written into ssh/config and used in the
                       repository string (default nas-restic)
 
+HOME ASSISTANT (optional, any run)
+  After every backup the outcome is published over MQTT, retained, to the broker
+  Home Assistant uses. Off until --ha-host is given; stored like everything else.
+  --ha-host HOST      MQTT broker address. --ha-host '' turns reporting off
+  --ha-port PORT      MQTT port (default 1883)
+  --ha-user USER      MQTT account for this machine
+  --ha-password-file FILE
+                      read the MQTT password from FILE once and store it in
+                      /etc/restic/mqtt-password. Without it an interactive run asks,
+                      so the password never appears on a command line
+  --ha-box NAME       this machine's name in Home Assistant (default: the NAS user)
+  --ha-topic TOPIC    state topic (default: restic/<box>)
+  Step 3 sends a test message, so "--only 3 --ha-host ..." is enough to switch it on
+  for a machine already set up.
+
 OPTIONS
   --from N            start at step N
   --only N            run just step N
@@ -162,6 +186,12 @@ while [ $# -gt 0 ]; do
         --repo-path)    REPO_PATH="$2";    GIVEN="$GIVEN repo-path";    shift 2 ;;
         --backup-paths) BACKUP_PATHS="$2"; GIVEN="$GIVEN backup-paths"; shift 2 ;;
         --host-alias)   HOST_ALIAS="$2";   GIVEN="$GIVEN host-alias";   shift 2 ;;
+        --ha-host)      HA_HOST="$2";      GIVEN="$GIVEN ha-host";      shift 2 ;;
+        --ha-port)      HA_PORT="$2";      GIVEN="$GIVEN ha-port";      shift 2 ;;
+        --ha-user)      HA_USER="$2";      GIVEN="$GIVEN ha-user";      shift 2 ;;
+        --ha-topic)     HA_TOPIC="$2";     GIVEN="$GIVEN ha-topic";     shift 2 ;;
+        --ha-box)       HA_BOX="$2";       GIVEN="$GIVEN ha-box";       shift 2 ;;
+        --ha-password-file) HA_PASSWORD_FROM="$2"; shift 2 ;;
         # Retired rather than silently ignored: a parameter that is accepted and does
         # nothing is worse than one that is gone. The schedule belongs to restic-ctl.
         --on-calendar)
@@ -254,6 +284,11 @@ if [ -f "$CONFIG" ]; then
     given repo-path || { v="$(cfg nas.repoPath)";       [ -n "$v" ] && REPO_PATH="$v"; }
     given host-alias || { v="$(cfg nas.hostAlias)";     [ -n "$v" ] && HOST_ALIAS="$v"; }
     given backup-paths || { v="$(cfg backupPaths)";     [ -n "$v" ] && BACKUP_PATHS="$v"; }
+    given ha-host  || { v="$(cfg homeAssistant.host)";  [ -n "$v" ] && HA_HOST="$v"; }
+    given ha-port  || { v="$(cfg homeAssistant.port)";  [ -n "$v" ] && HA_PORT="$v"; }
+    given ha-user  || { v="$(cfg homeAssistant.user)";  [ -n "$v" ] && HA_USER="$v"; }
+    given ha-topic || { v="$(cfg homeAssistant.topic)"; [ -n "$v" ] && HA_TOPIC="$v"; }
+    given ha-box   || { v="$(cfg homeAssistant.box)";   [ -n "$v" ] && HA_BOX="$v"; }
     # The schedule has no command-line override any more: it is whatever config.json
     # says, and "restic-ctl schedule" is what writes it.
     v="$(cfg schedule.onCalendar)";    [ -n "$v" ] && ON_CALENDAR="$v"
@@ -297,7 +332,14 @@ KEY_FILE="$SSH_DIR/id_ed25519"
 SSH_CONFIG="$SSH_DIR/config"
 KNOWN_HOSTS="$SSH_DIR/known_hosts"
 PASSWORD_FILE="$BASE/password"
+HA_PASSWORD_FILE="$BASE/mqtt-password"
 EXCLUDE_FILE="$BASE/excludes.txt"
+
+# Written unquoted into config.json, so a typo here would produce invalid JSON.
+case "$HA_PORT" in ''|*[!0-9]*) echo "--ha-port must be a number, got: $HA_PORT" >&2; exit 2 ;; esac
+if [ -n "$HA_PASSWORD_FROM" ] && [ ! -r "$HA_PASSWORD_FROM" ]; then
+    echo "--ha-password-file: cannot read $HA_PASSWORD_FROM" >&2; exit 2
+fi
 BACKUP_SCRIPT='/usr/local/bin/restic-backup.sh'
 REPOSITORY="sftp:$HOST_ALIAS:$REPO_PATH"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -553,6 +595,11 @@ info "Repository   $REPOSITORY"
 info "Local base   $BASE"
 info "Tools        $TOOLS_DIR"
 info "Backup paths $BACKUP_PATHS"
+if [ -n "$HA_HOST" ]; then
+    info "Home Asst.   ${HA_USER:-<no user>}@$HA_HOST:$HA_PORT, box ${HA_BOX:-$NAS_USER}, topic ${HA_TOPIC:-restic/${HA_BOX:-$NAS_USER}}"
+else
+    info 'Home Asst.   not configured (--ha-host to enable)'
+fi
 
 if [ -n "$MIGRATED_FROM" ]; then
     info "Config       migrated from $(basename "$MIGRATED_FROM")"
@@ -694,6 +741,14 @@ if should_run 3; then
     BACKUP_PATHS_JSON="$(printf '%s' "$BACKUP_PATHS" | python3 -c '
 import json, sys
 print(json.dumps(sys.stdin.read().split()))')"
+    # Through json.dumps rather than interpolated: a topic or an account name is free
+    # text, and one stray quote would make the whole file unreadable.
+    HA_JSON="$(HA_HOST="$HA_HOST" HA_PORT="$HA_PORT" HA_USER="$HA_USER" \
+               HA_TOPIC="$HA_TOPIC" HA_BOX="$HA_BOX" python3 -c '
+import json, os
+e = os.environ
+print(json.dumps({"host": e["HA_HOST"], "port": int(e["HA_PORT"]), "user": e["HA_USER"],
+                  "topic": e["HA_TOPIC"], "box": e["HA_BOX"]}))')"
     cat > "$CONFIG" <<EOF
 {
   "configVersion": 1,
@@ -709,6 +764,7 @@ print(json.dumps(sys.stdin.read().split()))')"
   "backupPaths": $BACKUP_PATHS_JSON,
   "retention": { "daily": $KEEP_DAILY, "weekly": $KEEP_WEEKLY, "monthly": $KEEP_MONTHLY },
   "schedule": { "onCalendar": "$ON_CALENDAR", "retryCalendar": "$RETRY_CALENDAR" },
+  "homeAssistant": $HA_JSON,
   "paths": { "base": "$BASE", "tools": "$TOOLS_DIR" }
 }
 EOF
@@ -863,6 +919,7 @@ EOF
 #   restic-backup.sh              normal run (what the systemd service does)
 #   restic-backup.sh --dry-run    list what would be backed up, no upload
 #   restic-backup.sh --init       one-time: create the repository
+#   restic-backup.sh --publish    re-send last-run.json to Home Assistant, no backup
 #   restic-backup.sh --help       this text
 #
 # Prefer "restic-ctl run" over calling this by hand: it goes through systemd, so the
@@ -881,7 +938,7 @@ HISTORY="$BASE/history.jsonl"
 # missing, which is exactly when someone reaches for it.
 case "${1:-}" in
     -h|--help)
-        sed -n '2,12p' "$0" | sed 's/^#//; s/^ //'
+        sed -n '2,13p' "$0" | sed 's/^#//; s/^ //'
         echo
         echo "Reads everything from $CONFIG: paths, retention, the NAS alias."
         echo 'Writes the log, progress.json, last-run.json and history.jsonl.'
@@ -912,6 +969,19 @@ KEEP_DAILY="$(cfg retention.daily)"
 KEEP_WEEKLY="$(cfg retention.weekly)"
 KEEP_MONTHLY="$(cfg retention.monthly)"
 
+# Optional keys: a config.json written before they existed must still work, so a
+# missing key reads as empty instead of stopping the backup.
+cfg_opt() { cfg "$1" 2>/dev/null || true; }
+
+# Home Assistant reporting. Empty host = off. Box and topic are composed when not set,
+# for the same reason as the repository string below.
+HA_HOST="$(cfg_opt homeAssistant.host)"
+HA_PORT="$(cfg_opt homeAssistant.port)"; HA_PORT="${HA_PORT:-1883}"
+HA_USER="$(cfg_opt homeAssistant.user)"
+HA_BOX="$(cfg_opt homeAssistant.box)";   HA_BOX="${HA_BOX:-$(cfg_opt nas.user)}"
+HA_TOPIC="$(cfg_opt homeAssistant.topic)"; HA_TOPIC="${HA_TOPIC:-restic/$HA_BOX}"
+HA_PASSWORD_FILE="$BASE/mqtt-password"
+
 # Composed, not stored, so the repository string can never drift from its parts.
 RESTIC_REPOSITORY="sftp:$HOST_ALIAS:$REPO_PATH"
 RESTIC_PASSWORD_FILE="$BASE/password"
@@ -925,6 +995,7 @@ MODE='backup'
 case "${1:-}" in
     --init)    MODE='init' ;;
     --dry-run) MODE='dryrun' ;;
+    --publish) MODE='publish' ;;
     '')        ;;
     *)         echo "unknown option: $1" >&2; exit 2 ;;
 esac
@@ -1020,6 +1091,130 @@ for raw in sys.stdin:
     fi
 }
 
+# Publishes last-run.json to Home Assistant's MQTT broker, retained, so HA shows the
+# latest outcome even after it restarts. Plain MQTT 3.1.1 over a socket, in python3
+# which is already required: no client package on every machine, and the password is
+# read from its file here instead of passing through a command line where any local
+# user could read it in the process list.
+#
+# Never allowed to change the backup's own result: a broker that is down is logged,
+# and the run exits exactly as it would have without it.
+ha_publish() {
+    [ -n "$HA_HOST" ] || return 0
+    python3 - "$HA_HOST" "$HA_PORT" "$HA_USER" "$HA_PASSWORD_FILE" "$HA_TOPIC" \
+              "$HA_BOX" "$LAST_RUN" "$LOG" <<'HA_PY_EOF'
+import datetime, json, os, re, socket, struct, sys, time
+
+host, port, user, pwfile, topic, box, last_run, logpath = sys.argv[1:9]
+
+def logline(msg):
+    with open(logpath, "a") as f:
+        f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + "ha: " + msg + "\n")
+
+def s(text):
+    b = text.encode("utf-8")
+    return struct.pack("!H", len(b)) + b
+
+def packet(kind, body):
+    n, rl = len(body), bytearray()
+    while True:
+        digit, n = n % 128, n // 128
+        rl.append(digit | (0x80 if n else 0))
+        if not n:
+            break
+    return bytes([kind]) + bytes(rl) + body
+
+def recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("broker closed the connection")
+        buf += chunk
+    return buf
+
+def read_packet(sock):
+    kind = recv_exact(sock, 1)[0]
+    length, shift = 0, 0
+    while True:
+        digit = recv_exact(sock, 1)[0]
+        length += (digit & 0x7F) << shift
+        if not digit & 0x80:
+            break
+        shift += 7
+    return kind, recv_exact(sock, length)
+
+try:
+    if not topic or "+" in topic or "#" in topic:
+        raise ValueError("invalid topic %r" % topic)
+    try:
+        with open(last_run) as f:
+            record = json.load(f)
+    except (OSError, ValueError):
+        # Nothing has run yet. Said explicitly rather than sending nothing, so HA can
+        # tell a machine that never backed up from one that is not reporting.
+        record = {"outcome": "never", "host": socket.gethostname()}
+    record["box"] = box
+    record["publishedAt"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    payload = json.dumps(record).encode("utf-8")
+
+    password = ""
+    if os.path.exists(pwfile):
+        with open(pwfile) as f:
+            password = f.read().strip()
+
+    # 23 characters is the longest client id MQTT 3.1.1 obliges a broker to accept.
+    # The box usually is the NAS account, restic-<host>, so the prefix is not doubled.
+    cid = re.sub(r"[^A-Za-z0-9_-]", "", box)
+    client_id = (cid if cid.startswith("restic") else "restic-" + cid)[:23]
+    flags = 0x02                                   # clean session
+    tail = s(client_id)
+    if user:
+        flags |= 0x80
+        tail += s(user)
+        if password:                               # 3.1.1: no password without a user
+            flags |= 0x40
+            tail += s(password)
+
+    sock = socket.create_connection((host, int(port)), timeout=15)
+    try:
+        sock.sendall(packet(0x10, s("MQTT") + bytes([4, flags]) + struct.pack("!H", 30) + tail))
+        kind, body = read_packet(sock)
+        if kind != 0x20 or len(body) != 2:
+            raise ConnectionError("unexpected reply to CONNECT (0x%02x)" % kind)
+        if body[1] != 0:
+            reasons = {1: "protocol version refused", 2: "client id refused",
+                       3: "server unavailable", 4: "bad user name or password",
+                       5: "not authorized"}
+            raise PermissionError(reasons.get(body[1], "refused, code %d" % body[1]))
+
+        # QoS 1 + retain: the broker confirms it has the message, and keeps it.
+        sock.sendall(packet(0x33, s(topic) + struct.pack("!H", 1) + payload))
+        while True:
+            kind, body = read_packet(sock)
+            if kind & 0xF0 == 0x40 and body[:2] == struct.pack("!H", 1):
+                break
+        sock.sendall(bytes([0xE0, 0]))
+    finally:
+        sock.close()
+    logline("published %s to %s on %s:%s" % (record.get("outcome"), topic, host, port))
+    print("published to %s on %s:%s" % (topic, host, port))
+except Exception as e:
+    logline("publish FAILED: %s" % e)
+    print("publish failed: %s" % e, file=sys.stderr)
+    sys.exit(1)
+HA_PY_EOF
+}
+
+if [ "$MODE" = 'publish' ]; then
+    if [ -z "$HA_HOST" ]; then
+        echo "Home Assistant is not configured (no homeAssistant.host in $CONFIG)." >&2
+        exit 2
+    fi
+    ha_publish
+    exit $?
+fi
+
 if [ "$MODE" = 'init' ]; then
     log '===== repository init ====='
     run_restic init
@@ -1109,15 +1304,33 @@ print(json.dumps(rec, indent=2))
 fi
 rm -f "$PROGRESS.summary"
 
-[ "$outcome" = 'failed' ] && exit "$rc"
+if [ "$outcome" = 'failed' ]; then
+    [ "$MODE" = 'dryrun' ] || ha_publish >/dev/null 2>&1 || true
+    exit "$rc"
+fi
 
 if [ "$MODE" != 'dryrun' ]; then
     run_restic forget --prune \
         --keep-daily "$KEEP_DAILY" \
         --keep-weekly "$KEEP_WEEKLY" \
         --keep-monthly "$KEEP_MONTHLY"
-    rc=$?
-    [ "$rc" -eq 0 ] || { log "forget/prune FAILED (exit $rc)"; exit "$rc"; }
+    prc=$?
+    if [ "$prc" -ne 0 ]; then
+        log "forget/prune FAILED (exit $prc)"
+        # Same record, outcome corrected: the snapshot exists, but the repository was
+        # not cleaned up, and repeated failures here mean it grows without limit.
+        # Matches what the Windows script records.
+        record="$(PRC="$prc" python3 -c '
+import json, os, sys
+r = json.load(open(sys.argv[1]))
+r["outcome"] = "prune-failed"
+r["pruneExitCode"] = int(os.environ["PRC"])
+print(json.dumps(r, indent=2))' "$LAST_RUN" 2>/dev/null)"
+        [ -n "$record" ] && write_json "$LAST_RUN" "$record"
+        ha_publish >/dev/null 2>&1 || true
+        exit "$prc"
+    fi
+    ha_publish >/dev/null 2>&1 || true
 fi
 
 log '===== backup finished ====='
@@ -1137,6 +1350,45 @@ BACKUP_SCRIPT_EOF
         ok '/usr/local/bin/restic-ctl'
     else
         info 'restic-ctl.sh not found next to this script, skipping its install'
+    fi
+
+    # --- Home Assistant: the MQTT password and a test message ---------------------
+    # The password gets its own root-only file, like the repository password, rather
+    # than a field in config.json: config.json is shown by "restic-ctl config" and is
+    # the file people copy around when comparing machines.
+    if [ -z "$HA_HOST" ]; then
+        info 'Home Assistant reporting off (--ha-host to enable)'
+    else
+        if [ -n "$HA_PASSWORD_FROM" ]; then
+            ( umask 077; tr -d '\r\n' < "$HA_PASSWORD_FROM" > "$HA_PASSWORD_FILE" ) \
+                || die "cannot write $HA_PASSWORD_FILE"
+            ok "MQTT password stored in $HA_PASSWORD_FILE"
+        elif [ -f "$HA_PASSWORD_FILE" ]; then
+            info 'MQTT password already present, kept (--ha-password-file to replace)'
+        elif [ -n "$HA_USER" ] && [ -t 0 ]; then
+            printf '    MQTT password for %s (input hidden, empty for none): ' "$HA_USER"
+            read -rs ha_pw; printf '\n'
+            if [ -n "$ha_pw" ]; then
+                ( umask 077; printf '%s' "$ha_pw" > "$HA_PASSWORD_FILE" ) \
+                    || die "cannot write $HA_PASSWORD_FILE"
+                ok "MQTT password stored in $HA_PASSWORD_FILE"
+            fi
+            unset ha_pw
+        elif [ -n "$HA_USER" ]; then
+            warn "no MQTT password stored and no terminal to ask: pass --ha-password-file"
+        fi
+        [ -f "$HA_PASSWORD_FILE" ] && chmod 600 "$HA_PASSWORD_FILE"
+
+        # Sent now rather than discovered wrong at 3 a.m.: a bad password or an
+        # unreachable broker shows here, while someone is looking. It republishes the
+        # last run, or "never" on a new machine - both true statements.
+        if out="$("$BACKUP_SCRIPT" --publish 2>&1)"; then
+            ok "Home Assistant: $out"
+        else
+            warn "Home Assistant: $out"
+            info 'The backup itself is not affected; it only stops reporting. Fix it'
+            info 'and re-run with --only 3, or test with: sudo restic-backup.sh --publish'
+        fi
     fi
 fi
 

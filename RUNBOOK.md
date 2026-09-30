@@ -783,6 +783,13 @@ Written and syntax-checked, but not yet exercised against the real NAS:
   `Register-ScheduledTask` and `systemctl daemon-reload` actually taking the new value.
   Run `restic-ctl schedule` with no argument afterwards: it reports both sides and says
   whether they agree, which is exactly the check
+- **Home Assistant reporting.** The Linux publisher was tested end to end — ok, failed
+  backup, failed prune, dry run, bad password, broker down, a config.json without the
+  section — but against a minimal MQTT broker written for the test, not against
+  Mosquitto. The Windows publisher is a port of the same logic that has only been
+  checked statically: no PowerShell was available. On each platform, the first
+  `-Only 3` / `--only 3` with the HA options is the real test: step 3 sends a message
+  and prints the broker's answer
 - no **restore** has been verified on any machine. This is the real gap, not a detail:
   a backup that has never been restored from is a hypothesis. `restic-ctl help restore`
   lists three ways to test one without needing free disk space

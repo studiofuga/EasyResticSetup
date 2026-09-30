@@ -999,9 +999,20 @@ cmd_config() {
     field 'Host alias'    "$HOST_ALIAS"
     field 'Backup paths'  "$BACKUP_PATHS"
     field 'Retention'     "$KEEP_DAILY daily, $KEEP_WEEKLY weekly, $KEEP_MONTHLY monthly"
+    ha_host="$(cfg homeAssistant.host)"
+    if [ -n "$ha_host" ]; then
+        ha_box="$(cfg homeAssistant.box)";     ha_box="${ha_box:-$NAS_USER}"
+        ha_topic="$(cfg homeAssistant.topic)"; ha_topic="${ha_topic:-restic/$ha_box}"
+        ha_user="$(cfg homeAssistant.user)";   ha_port="$(cfg homeAssistant.port)"
+        field 'Home Assistant' "${ha_user:-<no user>}@$ha_host:${ha_port:-1883}"
+        field 'HA box/topic'   "$ha_box  ->  $ha_topic"
+    else
+        field 'Home Assistant' 'not configured' "$C_DIM"
+    fi
 
     head_ 'Files'
     for pair in "Log:$LOG" "Excludes:$EXCLUDE_FILE" "Password:$RESTIC_PASSWORD_FILE" \
+                "MQTT password:$BASE/mqtt-password" \
                 "Last run:$LAST_RUN" "History:$HISTORY" "Progress:$PROGRESS"; do
         label="${pair%%:*}"; path="${pair#*:}"
         if [ -f "$path" ]; then

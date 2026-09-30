@@ -12,6 +12,7 @@ reference/
 # /etc/restic (Linux), never beside the scripts. These patterns exist so that a
 # careless copy into this folder cannot be committed by accident.
 password
+mqtt-password
 config.json
 settings.psd1*
 settings.env*
