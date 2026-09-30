@@ -37,10 +37,11 @@ Anything restic can do, without retyping the connection:
 .\restic-ctl.ps1 restore latest -Target D:\restore-test
 ```
 
-Every machine at once, from anywhere:
+Every machine at once, from anywhere, using the dedicated fleet-status account
+(setup in `RUNBOOK.md`):
 
 ```bash
-ssh <admin>@<nas> 'sudo sh -s' < nas-fleet-status.sh
+ssh <fleet-status-user>@<nas> 'sudo /usr/local/bin/nas-fleet-status.sh'
 ```
 
 ## Setting up a new machine

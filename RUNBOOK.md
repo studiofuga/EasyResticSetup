@@ -219,7 +219,7 @@ starts it and returns.
 ### The whole fleet
 
 ```bash
-ssh <admin>@<nas> 'sudo sh -s' < nas-fleet-status.sh
+ssh <fleet-status-user>@<nas> 'sudo /usr/local/bin/nas-fleet-status.sh'
 ```
 
 Per machine: snapshot count, date and age of the newest, repository size, and
@@ -233,6 +233,69 @@ which by design lives only on its own machine. A deeper fleet view would mean
 keeping all four passwords in one place, which would undo the isolation the
 per-machine accounts exist for. Exit code is 0 if every machine is fresh, 1 if
 any is stale, so it also works as a cron check.
+
+Verified against real repositories, run this way, on 2026-09-28.
+
+### Setting up the fleet-status account
+
+The script needs root — it reads the other accounts' homes, which are not
+world-readable, and refuses to run otherwise:
+
+```sh
+[ "$(id -u)" = 0 ] || { echo 'run this with sudo: the homes are not world-readable.' >&2; exit 2; }
+```
+
+Running it under the built-in `admin` works but is the wrong shape for
+something invoked unattended or from a script: it is a full DSM
+administrator, and a key installed on it is worth more than the read-only
+listing this is meant to grant. Give it its own account instead, scoped to
+exactly this one script.
+
+1. **DSM user.** Control Panel → User & Group → Create `<fleet-status-user>`,
+   member of `administrators` (SSH and `sudo` on DSM 7 are restricted to that
+   group; there is no narrower built-in role that still gets SSH).
+
+2. **Key-only login, permissions fixed up front.** The first attempt at this
+   (on a different admin account) failed silently: the server offered
+   `publickey,password`, refused a key that was correctly listed in
+   `authorized_keys`, and fell through to a password prompt — the classic
+   sign of `sshd`'s `StrictModes` rejecting a home directory or `.ssh` that
+   is group- or world-writable.
+   ```bash
+   ssh-copy-id -i ~/.ssh/id_ed25519.pub <fleet-status-user>@<nas>
+   ssh <fleet-status-user>@<nas> '
+     chmod 755 ~ && chmod go-w ~
+     chmod 700 ~/.ssh
+     chmod 600 ~/.ssh/authorized_keys
+   '
+   ssh -o PreferredAuthentications=publickey <fleet-status-user>@<nas> 'echo OK'
+   ```
+
+3. **Install the script at a fixed path**, so sudo can name it exactly:
+   ```bash
+   scp nas-fleet-status.sh <fleet-status-user>@<nas>:/tmp/
+   ssh <fleet-status-user>@<nas> 'sudo install -m 755 /tmp/nas-fleet-status.sh /usr/local/bin/nas-fleet-status.sh'
+   ```
+
+4. **Scope sudo to that one command** — `sudo visudo` on the NAS:
+   ```
+   <fleet-status-user> ALL=(root) NOPASSWD: /usr/local/bin/nas-fleet-status.sh
+   ```
+   Not `NOPASSWD: ALL`: that would make a leaked key for this account
+   equivalent to root on the NAS. Passwordless sudo is still needed —
+   otherwise the point of running this unattended is lost — it is just
+   scoped to the one script, at the one path, with no arguments.
+
+   *No-sudo alternative, considered and not taken:* `chgrp` the
+   `restic-<machine>` repositories to a shared group and grant that group
+   read access instead of using sudo at all. Rejected for now — it needs a
+   recursive `chgrp`/`chmod` on every repository, repeated for each new
+   machine, and the script's `id -u = 0` check would still have to be
+   patched to accept a non-root reader. Scoped sudo gets the same isolation
+   with one sudoers line and no change to the script.
+
+A major DSM update can rewrite `/etc/sudoers`; if the scoped line disappears
+after one, that is why.
 
 ## Adding a machine
 
@@ -709,8 +772,6 @@ data you have since excluded.
 Written and syntax-checked, but not yet exercised against the real NAS:
 
 - the `synoacltool` branch of the provisioning script — no Synology here to test on
-- `nas-fleet-status.sh` against real repositories: it was tested against a
-  fabricated `homes` tree, including under a POSIX shell for the busybox case
 - `--json` progress parsing on Windows: tested with simulated restic output, not
   with restic itself
 - the Power Request C# in the Windows backup script: it parses, and the log line
