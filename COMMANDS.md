@@ -348,7 +348,7 @@ Sends this machine's backup state to Home Assistant now: the same two messages t
 backup sends at the end of every run, QoS 1, retained, to the broker in the
 `homeAssistant` section of `config.json`:
 
-- `homeassistant/device/<id>/config`, MQTT discovery: Home Assistant creates the
+- `homeassistant/device/restic/<id>/config`, MQTT discovery: Home Assistant creates the
   device and its entities from it, so nothing is configured there for each machine;
 - `restic/<box>`, the state: `last-run.json` plus `box` and `publishedAt`.
 
@@ -368,7 +368,7 @@ works before a broker is configured.
   Login             password stored
   Client id         restic-<machine>
   Delivery          QoS 1, retained
-  Discovery         homeassistant/device/restic-<machine>/config, 1681 bytes
+  Discovery         homeassistant/device/restic/restic-<machine>/config, 1681 bytes
   Topic             restic/restic-<machine>, 358 bytes
 
     Discovery payload:
@@ -619,7 +619,7 @@ is already set up is a single step:
 sudo ./setup-restic-backup.sh --only 3 --ha-host <broker> --ha-user <mqtt-user>
 ```
 
-Two messages go out: the discovery message on `homeassistant/device/<id>/config`, then
+Two messages go out: the discovery message on `homeassistant/device/restic/<id>/config`, then
 the state on the topic above, which is the content of `last-run.json` plus `box` and
 `publishedAt`. On a machine that has never run a backup, `outcome` is `never`. Both are
 sent after every real run — success, failure, or failed prune — and never after a dry

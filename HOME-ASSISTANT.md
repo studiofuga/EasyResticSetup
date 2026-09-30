@@ -16,11 +16,14 @@ and on `restic-ctl publish`, each machine sends two messages, both QoS 1 and
 
 | Topic | Content |
 |---|---|
-| `homeassistant/device/<id>/config` | MQTT discovery: the device and its entities |
+| `homeassistant/device/restic/<id>/config` | MQTT discovery: the device and its entities |
 | `restic/<box>` | the state: `last-run.json` plus `box` and `publishedAt` |
 
 Discovery goes first, so Home Assistant is already subscribed to the state topic
-when the state arrives. Both are resent on every run; an unchanged discovery message
+when the state arrives. The `restic` level in the discovery topic is the optional
+node id Home Assistant allows there: it puts the whole fleet under one prefix, so the
+broker can grant `homeassistant/device/restic/#` and nothing else of the discovery
+space. Both are resent on every run; an unchanged discovery message
 costs Home Assistant nothing, and resending it brings a device back if it was
 deleted by mistake.
 
@@ -61,39 +64,66 @@ sudo restic-ctl publish --dry-run
 
 ## The broker
 
-With the Mosquitto add-on, give each machine its own MQTT account, either in the
-add-on's `logins` option or as a Home Assistant user. The account name and password
-are what the installer's `-HaUser` / `--ha-user` and password file expect.
-
-**If the broker has an ACL, each machine must be able to write both of its
+**If the broker has an ACL, every machine must be able to write both of its
 topics.** Mosquitto accepts a publish to a denied topic and silently drops it: the
 client sees a normal acknowledgement, `restic-ctl publish` reports success, and the
 device just never shows up in Home Assistant. The add-on's log says
-`Denied PUBLISH`. Per machine:
+`Denied PUBLISH`.
+
+The accounts go in the Mosquitto add-on's `logins` option, or are Home Assistant
+users. Their name and password are what the installer's `-HaUser` / `--ha-user` and
+password file expect. There are two ways to hand them out.
+
+### One account for the whole fleet
+
+Simplest: every machine uses the same account, and a new machine needs nothing on the
+broker.
+
+```
+user restic
+topic write restic/#
+topic write homeassistant/device/restic/#
+```
+
+It works because every machine has its own box, hence its own topics and client id.
+What it gives up is isolation: any machine, or anyone holding the password, which is
+on every machine, can overwrite or remove the state and the device of any other. The
+realistic harm is a false `ok` hiding a failed backup. Revoking one machine also
+means changing the password on all of them.
+
+### One account per machine
+
+Each machine can write only its own topics:
 
 ```
 user restic-laptop
 topic write restic/laptop
-topic write homeassistant/device/restic-laptop/config
+topic write homeassistant/device/restic/restic-laptop/config
 ```
 
-Or, for the discovery half, one line for the whole fleet, since the discovery id is
-the client id:
+The discovery half can be one line for the whole fleet, since the discovery id is the
+client id:
 
 ```
-pattern write homeassistant/device/%c/config
+pattern write homeassistant/device/restic/%c/config
 ```
 
-The pattern is looser: an authenticated machine that picks another machine's client
-id could overwrite that machine's device. The per-machine lines do not have that
-gap. The account Home Assistant itself connects with must keep read and write on
-`#`, or at least on `homeassistant/#` and `restic/#`: removing a device from the UI
-is done by publishing to its discovery topic.
+That line is looser than the per-machine one: a machine that connects with another
+machine's client id could overwrite that machine's device. The state topic has no
+such pattern, because it is named after the box, not the client id.
 
-To watch the traffic from any machine with the Mosquitto clients installed:
+### Home Assistant's own account
+
+Whatever account Home Assistant connects with must keep read and write on `#`, or at
+least on `homeassistant/#` and `restic/#`: removing a device from the UI is done by
+publishing to its discovery topic.
+
+### Watching the traffic
+
+From any machine with the Mosquitto clients installed:
 
 ```
-mosquitto_sub -h <broker> -u <user> -P <password> -v -t 'restic/#' -t 'homeassistant/device/#'
+mosquitto_sub -h <broker> -u <user> -P <password> -v -t 'restic/#' -t 'homeassistant/device/restic/#'
 ```
 
 ## Home Assistant: the whole fleet, once

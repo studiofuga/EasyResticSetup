@@ -400,12 +400,12 @@ restic-ctl publish - send this machine's backup state to Home Assistant.
 The same two messages the backup sends at the end of every run, over MQTT with QoS 1
 and the retain flag, to the broker in the homeAssistant section of config.json:
 
-  homeassistant/device/<id>/config   MQTT discovery. Home Assistant creates the
-                                     device and its entities from it, so nothing
-                                     is configured on the HA side for each machine.
-  restic/<box>                       the state: last-run.json plus "box" and
-                                     "publishedAt". A machine that has never run a
-                                     backup sends outcome "never".
+  homeassistant/device/restic/<id>/config
+        MQTT discovery. Home Assistant creates the device and its entities from
+        it, so nothing is configured on the HA side for each machine.
+  restic/<box>
+        the state: last-run.json plus "box" and "publishedAt". A machine that has
+        never run a backup sends outcome "never".
 
 Use it to check the broker settings without waiting for a backup, or to put a
 machine's state back after the retained message was cleared on the broker.

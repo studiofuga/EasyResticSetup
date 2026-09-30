@@ -196,7 +196,7 @@ $ErrorActionPreference = 'Stop'
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-$ScriptVersion = '2026.09.30.4'
+$ScriptVersion = '2026.09.30.5'
 
 # Which parameters the caller actually typed, as opposed to the ones that fell back
 # to a default. This is the whole basis of the configuration handling below: a
@@ -1460,7 +1460,7 @@ $HaOutcomes = @('ok', 'warnings', 'failed', 'prune-failed', 'never')
 function Get-HaMachineId {
     # One id for this machine, used as the MQTT client id and as the discovery id: the
     # same string in both places lets a broker ACL grant each machine its own discovery
-    # topic with a single "pattern write homeassistant/device/%c/config". Both allow
+    # topic with one line, "pattern write homeassistant/device/restic/%c/config". Both allow
     # [A-Za-z0-9_-]. The box usually is the NAS account, restic-<host>, so the prefix
     # is not doubled. 23 characters is the longest client id MQTT 3.1.1 obliges a
     # broker to accept.
@@ -1528,12 +1528,15 @@ function Get-HaDiscovery([string]$Id) {
 # Tells Home Assistant about this machine and its latest outcome over MQTT. Two
 # retained messages on one connection, so HA has both again after it restarts:
 #
-#   homeassistant/device/<id>/config   MQTT discovery: the device and its entities.
-#                                      HA creates them the first time it sees this,
-#                                      so a new machine needs nothing on the HA side.
-#   <topic>, restic/<box> by default   the state: last-run.json plus box and
-#                                      publishedAt. Every entity reads its value from
-#                                      here.
+#   homeassistant/device/restic/<id>/config
+#       MQTT discovery: the device and its entities. HA creates them the first time
+#       it sees this, so a new machine needs nothing on the HA side. "restic" is the
+#       optional node id level HA allows there: it keeps every machine of the fleet
+#       under one prefix, so a broker ACL can grant exactly homeassistant/device/
+#       restic/# and nothing else of HA's discovery space.
+#   <topic>, restic/<box> by default
+#       the state: last-run.json plus box and publishedAt. Every entity reads its
+#       value from here.
 #
 # Discovery goes first, so HA is already subscribed to the state topic when the state
 # arrives. Both are sent on every run: an unchanged discovery message costs HA nothing,
@@ -1557,7 +1560,7 @@ function Send-HaStatus([switch]$Preview, [switch]$Remove) {
             throw "invalid topic '$HaTopic'"
         }
         $deviceId = Get-HaMachineId
-        $configTopic = "$HaDiscoveryPrefix/device/$deviceId/config"
+        $configTopic = "$HaDiscoveryPrefix/device/restic/$deviceId/config"
 
         if ($Remove) {
             # Empty and retained: that is how MQTT deletes a retained message, and how

@@ -30,7 +30,7 @@ set -u
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-SCRIPT_VERSION='2026.09.30.4'
+SCRIPT_VERSION='2026.09.30.5'
 
 # ---- defaults ---------------------------------------------------------------
 # No default on purpose: nothing site-specific is baked into this script. The NAS
@@ -1108,12 +1108,15 @@ for raw in sys.stdin:
 # Tells Home Assistant about this machine and its latest outcome over MQTT. Two
 # retained messages on one connection, so HA has both again after it restarts:
 #
-#   homeassistant/device/<id>/config   MQTT discovery: the device and its entities.
-#                                      HA creates them the first time it sees this,
-#                                      so a new machine needs nothing on the HA side.
-#   <topic>, restic/<box> by default   the state: last-run.json plus box and
-#                                      publishedAt. Every entity reads its value
-#                                      from here.
+#   homeassistant/device/restic/<id>/config
+#       MQTT discovery: the device and its entities. HA creates them the first time
+#       it sees this, so a new machine needs nothing on the HA side. "restic" is the
+#       optional node id level HA allows there: it keeps every machine of the fleet
+#       under one prefix, so a broker ACL can grant exactly homeassistant/device/
+#       restic/# and nothing else of HA's discovery space.
+#   <topic>, restic/<box> by default
+#       the state: last-run.json plus box and publishedAt. Every entity reads its
+#       value from here.
 #
 # Discovery goes first, so HA is already subscribed to the state topic when the
 # state arrives. Both are sent on every run: an unchanged discovery message costs HA
@@ -1195,7 +1198,7 @@ def read_packet(sock):
 def machine_id(box):
     # One id for this machine, used as the MQTT client id and as the discovery id:
     # the same string in both places lets a broker ACL grant each machine its own
-    # discovery topic with a single "pattern write homeassistant/device/%c/config".
+    # discovery topic with one line, "pattern write homeassistant/device/restic/%c/config".
     # Both allow [A-Za-z0-9_-]. The box usually is the NAS account, restic-<host>, so
     # the prefix is not doubled. 23 characters is the longest client id MQTT 3.1.1
     # obliges a broker to accept.
@@ -1266,7 +1269,7 @@ try:
     if not topic or "+" in topic or "#" in topic:
         raise ValueError("invalid topic %r" % topic)
     ident = machine_id(box)
-    config_topic = "%s/device/%s/config" % (DISCOVERY_PREFIX, ident)
+    config_topic = "%s/device/restic/%s/config" % (DISCOVERY_PREFIX, ident)
 
     if removing:
         # Empty and retained: that is how MQTT deletes a retained message, and how
