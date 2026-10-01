@@ -17,7 +17,7 @@ and on `restic-ctl publish`, each machine sends two messages, both QoS 1 and
 | Topic | Content |
 |---|---|
 | `homeassistant/device/restic/<id>/config` | MQTT discovery: the device and its entities |
-| `restic/<box>` | the state: `last-run.json` plus `box` and `publishedAt` |
+| `restic/<box>` | the state: `last-run.json` plus `box`, `verify` and `publishedAt` |
 
 Discovery goes first, so Home Assistant is already subscribed to the state topic
 when the state arrives. The `restic` level in the discovery topic is the optional
@@ -51,6 +51,16 @@ each machine its own box.
 | Data added | sensor, bytes | `dataAddedBytes` | what the last snapshot added to the repository |
 | Source size | sensor, bytes | `bytesProcessed` | the size of what was backed up |
 | Problem | binary sensor, problem | `outcome` | on for anything but `ok`, including `warnings` and `never` |
+| Verification | sensor, enum | `verify.status` | `ok`, `error` (a check could not run), `failed` (a check found damage, or the prune is frozen), `never` |
+| Last data check | sensor, timestamp | `verify.data.at` | the last run of the rotating data check |
+| Data fully verified | sensor, timestamp | `verify.data.cycleCompletedAt` | when the data check last finished a full pass over the repository |
+| Verification problem | binary sensor, problem | `verify.status` | on for `failed` and `error`; off for `never`, so a machine just updated does not alarm before its first check |
+
+The `verify` block carries the latest result of each level of verification (see
+`restic-ctl help verify`): `sample`, the read-back after each backup; `data`, the
+daily slice of `restic check --read-data-subset`; and `pruneFrozen` with its reason
+when a check found damage. It is read from `verify-state.json` on every publish, so a
+backup and a check never overwrite each other's results.
 
 A machine that has never backed up sends only `outcome: never`: the other sensors
 read *unknown* until its first run.
@@ -129,9 +139,16 @@ mosquitto_sub -h <broker> -u <user> -P <password> -v -t 'restic/#' -t 'homeassis
 ## Home Assistant: the whole fleet, once
 
 The devices need nothing. What a retained message cannot tell you is that a machine
-has **stopped** backing up: its last `ok` stays `ok` forever. One template sensor
-covers that for every machine, including the ones added later, by looking at each
-*Last run* and each *Problem*; one automation turns it into a notification.
+has **stopped** backing up: its last `ok` stays `ok` forever. The same goes for the
+data check. One template sensor covers every machine, including the ones added later,
+and flags four things:
+
+- no backup in 36 hours (*Last run*), or a backup that did not end `ok` (*Problem*);
+- a verification that found damage or could not run (*Verification problem*);
+- no data check in 72 hours (*Last data check*). A machine that has not had its first
+  data check yet is not flagged for this: *Verification* reads `never` for it.
+
+One automation turns the count into a notification.
 
 Both go in a single package file, not in `configuration.yaml` itself. The default
 `configuration.yaml` already has `automation: !include automations.yaml`, and often a
@@ -162,28 +179,44 @@ machines lives in one.
          - name: "Restic attention"
            unique_id: restic_attention
            icon: mdi:backup-restore
-           # How many machines need a look; the list is in the "machines" attribute.
+           # How many problems need a look; the list is in the "machines" attribute. The
+           # same loop as below, counted: a template sensor's state cannot read its own
+           # attributes.
            state: >
-             {% set ns = namespace(n=0) %}
+             {% set ns = namespace(l=[]) %}
              {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
                {% set t = states(e) | as_datetime(none) %}
                {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
+               {% set vp = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_verification_problem') %}
+               {% set dc = states(e | replace('_last_run', '_last_data_check')) | as_datetime(none) %}
                {% if t is none or now() - t > timedelta(hours=36) or is_state(p, 'on') %}
-                 {% set ns.n = ns.n + 1 %}
+                 {% set ns.l = ns.l + [e] %}
                {% endif %}
+               {% if is_state(vp, 'on') %}{% set ns.l = ns.l + [vp] %}{% endif %}
+               {% if dc is not none and now() - dc > timedelta(hours=72) %}{% set ns.l = ns.l + [e] %}{% endif %}
              {% endfor %}
-             {{ ns.n }}
+             {{ ns.l | count }}
            attributes:
              machines: >
                {% set ns = namespace(l=[]) %}
                {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
+                 {% set n = device_attr(e, 'name') %}
                  {% set t = states(e) | as_datetime(none) %}
                  {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
                  {% set o = states(e | replace('_last_run', '_outcome')) %}
+                 {% set vp = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_verification_problem') %}
+                 {% set v = states(e | replace('_last_run', '_verification')) %}
+                 {% set dc = states(e | replace('_last_run', '_last_data_check')) | as_datetime(none) %}
                  {% if t is none or now() - t > timedelta(hours=36) %}
-                   {% set ns.l = ns.l + [device_attr(e, 'name') ~ ': no run in 36 h (' ~ o ~ ')'] %}
+                   {% set ns.l = ns.l + [n ~ ': no run in 36 h (' ~ o ~ ')'] %}
                  {% elif is_state(p, 'on') %}
-                   {% set ns.l = ns.l + [device_attr(e, 'name') ~ ': ' ~ o] %}
+                   {% set ns.l = ns.l + [n ~ ': ' ~ o] %}
+                 {% endif %}
+                 {% if is_state(vp, 'on') %}
+                   {% set ns.l = ns.l + [n ~ ': verification ' ~ v] %}
+                 {% endif %}
+                 {% if dc is not none and now() - dc > timedelta(hours=72) %}
+                   {% set ns.l = ns.l + [n ~ ': no data check in 72 h'] %}
                  {% endif %}
                {% endfor %}
                {{ ns.l }}
@@ -240,9 +273,10 @@ prove the target works.
 
 ### Tuning
 
-36 hours is one missed daily run plus margin. A machine that is often off for a day
-or two will show up here; raise it (three places in the template: the two
-`timedelta(hours=36)` and the `36 h` in the message), or accept that as the point.
+36 hours is one missed daily run plus margin, 72 hours for the data check, which
+skips days on battery and while a backup runs. A machine that is often off for a day
+or two will show up here; raise them (each appears in both loops, and in the message
+text), or accept that as the point.
 
 Both the sensor and the automation rely on the entity ids Home Assistant generated,
 `sensor.restic_<name>_last_run` and so on. Renaming a device in the UI does not change

@@ -22,6 +22,7 @@ command take".
     [schedule](#restic-ctl-schedule) · [history](#restic-ctl-history) ·
     [log](#restic-ctl-log) · [config](#restic-ctl-config) ·
     [publish](#restic-ctl-publish) · [unpublish](#restic-ctl-unpublish) ·
+    [verify](#restic-ctl-verify) · [unfreeze](#restic-ctl-unfreeze) ·
     [help](#restic-ctl-help)
   - [exec](#restic-ctl-exec) · [forget](#restic-ctl-forget) ·
     [restore](#restic-ctl-restore) · [unlock](#restic-ctl-unlock) ·
@@ -63,11 +64,13 @@ script and the NAS provisioning script. Everything you want to change is in
 | The generated backup script | `C:\ProgramData\restic\restic-backup.ps1` | `/usr/local/bin/restic-backup.sh` |
 | Log | `…\restic\logs\restic-backup.log` | `/var/log/restic-backup.log` |
 | Scheduler | Task Scheduler task `restic-backup`, running as `SYSTEM` | `restic-backup.service` + `restic-backup.timer` |
+| Data check | Task Scheduler task `restic-verify`, running as `SYSTEM` | `restic-verify.service` + `restic-verify.timer` |
 | Who may read the credentials | `SYSTEM` and `Administrators` only | `root` only |
 
 Under the configuration directory, on both: `config.json`, `password`,
 `excludes.txt`, `ssh/config`, `ssh/id_ed25519`, `ssh/known_hosts`, `progress.json`,
-`last-run.json`, `history.jsonl`, `cache/`.
+`last-run.json`, `history.jsonl`, `verify-state.json`, `manifest/`, `cache/`, and
+`prune-frozen.json` while a check has found damage.
 
 ## How to read the two spellings
 
@@ -102,6 +105,9 @@ also run `.\restic-ctl.ps1` or `./restic-ctl.sh` directly.
 | What would Home Assistant get? | `restic-ctl publish --dry-run` | `sudo restic-ctl publish --dry-run` |
 | Send it to Home Assistant now | `restic-ctl publish` | `sudo restic-ctl publish` |
 | Remove the machine from Home Assistant | `restic-ctl unpublish` | `sudo restic-ctl unpublish` |
+| Read back a sample of the latest snapshot | `restic-ctl verify -Sample` | `sudo restic-ctl verify --sample` |
+| Run today's data check now | `restic-ctl verify` | `sudo restic-ctl verify` |
+| Prune again after a check found damage | `restic-ctl unfreeze` | `sudo restic-ctl unfreeze` |
 | Install or repair | `.\Setup-ResticBackup.ps1` | `sudo ./setup-restic-backup.sh` |
 | Update to newer scripts | `.\Setup-ResticBackup.ps1 -Update` | `sudo ./setup-restic-backup.sh --update` |
 | Whole fleet, from the NAS | `sudo sh nas-fleet-status.sh` (on the NAS) | same |
@@ -416,6 +422,49 @@ sudo systemctl disable --now restic-backup.timer && sudo restic-ctl unpublish
 
 Exit codes as for `publish`.
 
+### `restic-ctl verify`
+
+```
+restic-ctl verify [-Sample]             (--sample works too)
+sudo restic-ctl verify [--sample]
+```
+
+Runs one of the two automatic verification levels now; `restic-ctl status` shows the
+result of both, and *Automatic verification* in `RUNBOOK.md` explains them.
+
+- **`--sample`** (level 1, also run after every backup): up to `verify.sampleFiles`
+  files (8) that the latest snapshot added or changed, at most `verify.sampleMaxMiB`
+  (256), read back with `restic dump` and hashed as they stream - nothing written to
+  disk. A file unchanged on disk since the snapshot started is compared with the
+  original too. With no parent snapshot, or nothing changed, the sample is drawn from
+  the whole snapshot.
+- **default** (level 2, also run daily by its own timer or task): the next slice of
+  `restic check --read-data-subset=n/N`, N = `verify.dataSubsets` (30). Goes through
+  systemd / Task Scheduler, like the scheduled run, and waits for it. On battery it
+  does not start, and says so.
+
+Outcomes: `ok`, `skipped`, `error` (could not run: no evidence about the data),
+`failed` and `mismatch` (damage). The last two **freeze the prune** until
+`restic-ctl unfreeze`.
+
+Cost: the sample, seconds and up to 256 MiB; the data check, about 1/N of the
+repository plus its metadata, which `restic check` re-reads without the local cache.
+
+Exit codes: 0 ok or skipped, 1 damage found (or the check could not be started), 2 the
+check could not run.
+
+### `restic-ctl unfreeze`
+
+```
+restic-ctl unfreeze [-Yes]
+sudo restic-ctl unfreeze [--yes]
+```
+
+After a check found damage, every backup skips forget/prune while `prune-frozen.json`
+exists. This shows why it was frozen, asks you to type `UNFREEZE` (`--yes` skips it),
+keeps the file as `prune-frozen.json.cleared`, logs who did it, and updates Home
+Assistant. Investigate first: *When a check finds damage* in `RUNBOOK.md`.
+
 ### `restic-ctl help`
 
 ```
@@ -714,6 +763,8 @@ that actually matters.
 .\restic-backup.ps1 -Publish -DryRun   print the topic and payload, send nothing
 .\restic-backup.ps1 -Unpublish   remove this machine from Home Assistant
 .\restic-backup.ps1 -Unpublish -DryRun
+.\restic-backup.ps1 -VerifySample [-Snapshot <id>]   level 1: read back a sample
+.\restic-backup.ps1 -VerifyData   level 2: the next slice of the data check
 
 restic-backup.sh               normal run (what the service does)
 restic-backup.sh --dry-run
@@ -722,8 +773,14 @@ restic-backup.sh --publish
 restic-backup.sh --publish --dry-run
 restic-backup.sh --unpublish
 restic-backup.sh --unpublish --dry-run
+restic-backup.sh --verify-sample [SNAPSHOT]
+restic-backup.sh --verify-data
 restic-backup.sh --help
 ```
+
+`--verify-sample` defaults to the latest snapshot; `--verify-data` is what the
+restic-verify timer or task runs. Both write `verify-state.json`, publish to Home
+Assistant, and exit 0 ok or skipped, 1 damage found, 2 the check could not run.
 
 `-Publish` / `--publish` sends the discovery and state messages; `-Unpublish` /
 `--unpublish` empties both. Each exits 0 when the broker confirmed the messages, 1 when
@@ -734,9 +791,14 @@ friendlier way in.
 
 It reads everything from `config.json` and writes the log, `progress.json`,
 `last-run.json` and `history.jsonl`. On Windows it uses `--use-fs-snapshot` (VSS), which
-is why it needs to run elevated. On both it applies the retention policy after a
-successful run, and asks the OS not to sleep while it works — Windows through the Power
-Request API, Linux through `systemd-inhibit --what=idle`.
+is why it needs to run elevated. On both it asks the OS not to sleep while it works —
+Windows through the Power Request API, Linux through `systemd-inhibit --what=idle`.
+
+A normal run, in order: clear stale locks; write the package manifest (`manifest/`,
+added to the backup paths when they do not already cover it); back up; record the
+outcome; read back a sample of the new snapshot; then forget/prune - unless
+`prune-frozen.json` exists, in which case the prune is skipped and logged; finally
+publish to Home Assistant.
 
 **Edits here are overwritten by the next update.** Change `config.json`, or the installer
 that generates this file.
@@ -817,6 +879,7 @@ site-specific lives.
   "schedule": { "time": "03:30", "timeLimitHours": 20, "wakeToRun": false },
   "homeAssistant": { "host": "ha.example.lan", "port": 1883, "user": "restic-machinename",
                      "topic": "", "box": "" },
+  "verify": { "sampleFiles": 8, "sampleMaxMiB": 256, "dataSubsets": 30, "time": "15:00" },
   "paths": { "base": "C:\\ProgramData\\restic", "tools": "C:\\Program Files\\restic-backup" }
 }
 ```
@@ -829,6 +892,8 @@ site-specific lives.
 | `schedule.time`, `schedule.timeLimitHours`, `schedule.wakeToRun` | `restic-ctl schedule`, then step 8 | step 8 (Windows) |
 | `schedule.onCalendar`, `schedule.retryCalendar` | `restic-ctl schedule`, then step 8 | step 8 (Linux) |
 | `paths.base`, `paths.tools` | the installer | `restic-ctl schedule`, to find the installer |
+| `verify.sampleFiles`, `verify.sampleMaxMiB`, `verify.dataSubsets` | the installer, defaults 8, 256, 30; edit by hand | the backup script. A changed `dataSubsets` restarts the data-check cycle |
+| `verify.time` (Windows), `verify.onCalendar` (Linux) | the installer, default 15:00; edit by hand, then step 8 | step 8, for the restic-verify task / timer |
 | `homeAssistant.*` | the installer (`-Ha*` / `--ha-*`) | the backup script, `restic-ctl config`. Empty `host` means off; empty `box` and `topic` are composed at run time. The MQTT password is **not** here: it is in `mqtt-password`, locked like the repository password |
 
 `paths.tools` is the **tools** directory, not the `PATH` directory: on Linux

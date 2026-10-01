@@ -673,6 +673,70 @@ If the machine is a desktop that sleeps rather than a laptop, add `-WakeToRun` o
 Windows so the task wakes it at the scheduled time. It is off by default because
 waking a laptop on battery only to skip the backup is pointless.
 
+## Automatic verification
+
+Two levels run on their own on every machine. Both read data back from the NAS and
+write nothing to the local disk; their results are in `restic-ctl status`, in
+`verify-state.json`, and in Home Assistant (*Verification*, *Last data check*, *Data
+fully verified*, *Verification problem*).
+
+| | Level 1: sample | Level 2: data check |
+|---|---|---|
+| When | after every backup, before the prune | daily, own timer / task (`verify.onCalendar` on Linux, `verify.time` on Windows, default 15:00) |
+| What | up to 8 files the new snapshot added or changed, at most 256 MiB, read back with `restic dump` and hashed as they stream | `restic check --read-data-subset=n/30`: one thirtieth of the repository's packs, downloaded and verified |
+| Also | when a file is unchanged on disk since the snapshot started, its hash is compared with the original | `n` moves on only after a good run, so 30 good runs cover the whole repository once |
+| Cost | seconds, up to 256 MiB | about 1/30 of the repository a day (~4 GiB for a 126 GiB repository), plus its metadata |
+| Run by hand | `restic-ctl verify --sample` | `restic-ctl verify` |
+
+Settings live in the `verify` section of `config.json` (`sampleFiles`, `sampleMaxMiB`,
+`dataSubsets`, and the schedule); after editing it, re-run the installer with
+`--only 3` and `--only 8` (`-Only 3`, `-Only 8`). Changing `dataSubsets` restarts the
+cycle from slice 1.
+
+**What an outcome means:**
+
+- `ok`, `skipped` - nothing to do. `skipped` is a sample with nothing suitable to read
+  (no file small enough, or none left on disk), or a data check that found a backup
+  running and will take the same slice next time.
+- `error` - the check **could not run**: lock held, NAS unreachable, SSH failing. It
+  says nothing about the data, freezes nothing, and the same slice is tried again.
+  Repeated errors are a reachability problem, not a repository problem.
+- `failed`, `mismatch` - **damage**: a dump failed twice, a read-back differs from an
+  unchanged original, or restic check reported an error.
+
+### When a check finds damage: the prune freeze
+
+`failed` and `mismatch` write `prune-frozen.json` next to `config.json`. While it
+exists, every backup still runs, but **forget/prune is skipped**: prune rewrites
+packs, and doing that on a damaged repository can turn a recoverable problem into an
+unrecoverable one. `restic-ctl status` shows the freeze and its reason; Home
+Assistant shows *Verification* as `failed`.
+
+What to do:
+
+1. Read what the check saw: `restic-ctl log`, the lines starting `verify-sample:` or
+   `verify-data:`, and restic's own output right after them.
+2. Widen the look: `restic-ctl check --data` re-reads more of the repository.
+3. A `mismatch` on a single file that was being written at the time can be a false
+   alarm - the comparison only uses files whose modification time is older than the
+   snapshot, but an application that rewrites a file and restores its timestamp
+   defeats that. Check the file named in the log.
+4. If restic reports damaged packs or snapshots, its own tools are
+   `restic-ctl exec repair packs` and `restic-ctl exec repair snapshots`. Nothing is
+   ever repaired automatically.
+5. When satisfied: `restic-ctl unfreeze`. It shows the reason, asks for `UNFREEZE`,
+   keeps the old file as `prune-frozen.json.cleared`, and updates Home Assistant.
+
+### The package manifest
+
+Before every backup the script writes `manifest/` in the configuration directory, and
+backs it up with everything else: on Linux the hand-installed apt packages, every
+dpkg package with its version, flatpaks (system and per user) and snaps; on Windows
+Programs and Features (machine-wide, and per user for users logged on), Store apps,
+enabled optional features, and Chocolatey and winget when they are present and usable
+as SYSTEM. `manifest/README.txt` says how to reinstall from each list. A reinstall
+starts from these instead of from memory.
+
 ## Verifying a backup without the disk space for a restore
 
 A full restore is the most expensive test, not the best one. Three layers answer three
@@ -793,9 +857,27 @@ Written and syntax-checked, but not yet exercised against the real NAS:
   in the log, before any credentials are sent, not with an authentication error.
   **Not yet seen** is the fleet template and automation in `HOME-ASSISTANT.md` inside
   Home Assistant. Their logic was run with Home Assistant's functions stubbed out (a
-  stale machine, a failed one, one that never ran, one fine: three flagged), and the
-  package parses as YAML and Jinja - but that is not Home Assistant. *Checking that it
-  sees the machines* in `HOME-ASSISTANT.md` is the real test
+  stale machine, a failed one, one with a failed verification, one with no data check
+  in 72 hours, one not checked yet and one fine: four flagged), and the package parses
+  as YAML and Jinja - but that is not Home Assistant. *Checking that it sees the
+  machines* in `HOME-ASSISTANT.md` is the real test
+- **Automatic verification and the package manifest** (2026-10-01). Tested end to end
+  against a fake restic on both platforms - Linux natively, Windows under PowerShell 7
+  on Linux - covering: a clean sample, a dump that fails once and then succeeds, a
+  mismatch, a dump that fails twice, the prune freeze holding across backups, the
+  fallback to a random sample with no parent snapshot, a file changed after the
+  snapshot (read back, not compared), a sample budget too small, the data-check cycle
+  wrapping and restarting when N changes, lock and SSH failures classified as `error`,
+  damage as `failed`. The new discovery entities are identical on both platforms.
+  **Not yet seen:** real restic output - the field names of `diff --json`,
+  `snapshots --json` and `ls --json` are as documented but were never read from a real
+  repository here; the Windows path form in a snapshot (`/C/Users/...` is assumed,
+  `C:/Users/...` also handled); Windows PowerShell 5.1 itself; the manifest's Windows
+  sources (registry, Appx, optional features, winget as SYSTEM), which only had
+  their failure paths run; the restic-verify timer and task actually firing, and
+  `restic-ctl verify` waiting on them. The first real backup after `--update` /
+  `-Update` is the test: `restic-ctl status` should then show a sample result, and
+  `restic-ctl verify` a data check
 - no **restore** has been verified on any machine. This is the real gap, not a detail:
   a backup that has never been restored from is a hypothesis. `restic-ctl help restore`
   lists three ways to test one without needing free disk space

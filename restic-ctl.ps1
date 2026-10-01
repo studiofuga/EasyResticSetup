@@ -17,6 +17,8 @@
       config      the effective settings of this machine
       publish     send the last result to Home Assistant now (--dry-run: show it)
       unpublish   remove this machine from Home Assistant
+      verify      run the data check now (-Sample: the sample check instead)
+      unfreeze    allow forget/prune again after a check found damage
       help        the command list, or the detail for one command
 
     And, as a wrapper over restic itself, so the repository, the password file
@@ -76,7 +78,7 @@ param(
     [Parameter(Position = 0)]
     [ValidateSet('status', 'snapshots', 'run', 'check', 'schedule', 'history', 'log',
                  'config', 'exec', 'forget', 'restore', 'unlock', 'ls', 'find', 'publish',
-                 'unpublish', 'help')]
+                 'unpublish', 'verify', 'unfreeze', 'help')]
     [string] $Command = 'status',
 
     [string] $Base   = 'C:\ProgramData\restic',
@@ -94,6 +96,7 @@ param(
     [string] $TaskName = 'restic-backup',
     [switch] $Help,          # same as the help command, so -Help works anywhere
     [switch] $DryRun,        # publish, unpublish: print the messages, send nothing
+    [switch] $Sample,        # verify: the sample check instead of the data check
                              # (--dry-run, the Linux spelling, works too)
 
     # schedule: 0 means "leave whatever is stored alone". The three of them used to be
@@ -112,7 +115,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$CtlVersion = '2026.09.30.3'
+$CtlVersion = '2026.10.01.1'
 
 # Which parameters were actually typed. "schedule -TimeLimitHours 0" has to be told
 # apart from "schedule" with the default still sitting there.
@@ -159,6 +162,9 @@ ACTING
                       --dry-run prints the topic and payload and sends nothing
   unpublish [--dry-run]
                       remove this machine's device and state from Home Assistant
+  verify [-Sample]    run the next slice of the data check now, through the
+                      scheduler; -Sample: read back a sample of the latest snapshot
+  unfreeze            allow forget/prune again after a check found damage
 
 PASSTHROUGH  (restic itself, with this machine's repository, password file and
               sftp.command already filled in)
@@ -455,6 +461,54 @@ restic-backup.ps1 predates it says so: re-run Setup-ResticBackup.ps1 -Update.
 
 Exit codes: 0 sent (or previewed), 1 the broker did not accept it, 2 Home
 Assistant is not configured.
+'@
+
+$HelpTopics['verify'] = @'
+restic-ctl verify - check that what is in the repository can be read back.
+
+  restic-ctl verify             the next slice of the data check, now
+  restic-ctl verify -Sample     a sample of the latest snapshot, read back
+                                (--sample works too)
+
+Two levels run on their own; this command runs one of them on demand.
+
+Level 1, the sample (-Sample). After every backup, up to verify.sampleFiles files
+the new snapshot added or changed (default 8, at most verify.sampleMaxMiB, default
+256 MiB) are read back with "restic dump" and hashed as they stream: nothing is
+written to disk. restic verifies every blob while decrypting, so a dump that
+completes is intact data. A file that has not changed on disk since the snapshot
+started is also compared with the original. Here it runs against the latest
+snapshot.
+
+Level 2, the data check (the default). The restic-verify task runs
+"restic check --read-data-subset=n/N" every day (verify.time), with n moving on
+after each good run: after N good runs (verify.dataSubsets, default 30) every pack
+in the repository has been downloaded and verified once. Here it is started through
+the scheduler, as SYSTEM like the scheduled one, and this waits for the result.
+
+Outcomes: ok; skipped; failed or mismatch - restic or the comparison found damage;
+error - the check could not run (lock held, NAS unreachable), which says nothing
+about the data.
+
+A failed or mismatched check FREEZES the prune: backups go on, but forget/prune is
+skipped until "restic-ctl unfreeze", because pruning rewrites packs and doing that on
+a damaged repository can make it worse. "restic-ctl status" shows the freeze and
+both levels; Home Assistant gets them in the Verification entities.
+'@
+
+$HelpTopics['unfreeze'] = @'
+restic-ctl unfreeze - allow forget/prune again after a check found damage.
+
+  restic-ctl unfreeze [-Yes]
+
+A failed or mismatched verification writes prune-frozen.json, and while it exists
+every backup skips forget/prune. This shows why it was frozen, asks for
+confirmation, removes the file and tells Home Assistant.
+
+Look before unfreezing: "restic-ctl log" for the check's own output, then
+"restic-ctl check -Data" for a wider read. If restic reports damaged packs,
+"restic-ctl exec repair packs" / "exec repair snapshots" are restic's own tools; the
+repository is never repaired automatically.
 '@
 
 $HelpTopics['unpublish'] = @'
@@ -760,6 +814,8 @@ function Show-Status {
             Write-Cont "restic-ctl.ps1 history   for the full table" 'DarkGray'
         }
     }
+
+    Show-Verification
 
     # --- scheduler
     Write-Head 'Scheduler'
@@ -1212,12 +1268,22 @@ function Show-Config {
         Write-Field 'Home Assistant' 'not configured' 'DarkGray'
     }
 
+    $v = $Config.verify
+    $vf = if ($v -and $v.sampleFiles) { $v.sampleFiles } else { 8 }
+    $vm = if ($v -and $v.sampleMaxMiB) { $v.sampleMaxMiB } else { 256 }
+    $vn = if ($v -and $v.dataSubsets) { $v.dataSubsets } else { 30 }
+    $vt = if ($v -and $v.time) { $v.time } else { '15:00' }
+    Write-Field 'Verification' "sample $vf files / $vm MiB after each backup"
+    Write-Cont "data check 1/$vn of the repository, daily at $vt (task restic-verify)"
+
     Write-Head 'Files'
     foreach ($f in @(
         @('Log',        $LogFile),
         @('Excludes',   (Join-Path $Base 'excludes.txt')),
         @('Password',   $PasswordFile),
         @('MQTT password', (Join-Path $Base 'mqtt-password')),
+        @('Verify state',  (Join-Path $Base 'verify-state.json')),
+        @('Prune frozen',  (Join-Path $Base 'prune-frozen.json')),
         @('Last run',   $LastRunFile),
         @('History',    $HistoryFile),
         @('Progress',   $ProgressFile)
@@ -1718,6 +1784,138 @@ function Invoke-Publish([switch]$Remove) {
     exit $rc
 }
 
+# ============================================================ verification
+
+$VerifyStateFile = Join-Path $Base 'verify-state.json'
+$FrozenFile      = Join-Path $Base 'prune-frozen.json'
+$VerifyTaskName  = 'restic-verify'
+
+function Read-JsonOrNull([string]$Path) {
+    if (-not (Test-Path $Path)) { return $null }
+    try { return (Get-Content $Path -Raw | ConvertFrom-Json) } catch { return $null }
+}
+
+function Get-OutcomeColor([string]$Outcome) {
+    switch ($Outcome) { 'ok' { 'Green' } 'skipped' { 'DarkGray' } 'error' { 'Yellow' } default { 'Red' } }
+}
+
+function Show-Verification {
+    Write-Head 'Verification'
+    $st = Read-JsonOrNull $VerifyStateFile
+    $frozen = Read-JsonOrNull $FrozenFile
+    if ($frozen) {
+        Write-Field 'Prune' "FROZEN since $($frozen.since)" 'Red'
+        Write-Cont "$($frozen.reason)" 'Red'
+        Write-Cont 'after a look: restic-ctl unfreeze' 'Yellow'
+    }
+    $s = if ($st) { $st.sample } else { $null }
+    if ($s) {
+        Write-Field 'Sample check' ("{0}   {1}, snapshot {2}" -f "$($s.outcome)".ToUpper(), $s.at, $s.snapshotId) (Get-OutcomeColor $s.outcome)
+        Write-Cont ("{0} files read back, {1} compared with the original, {2:N1} MiB" -f `
+            $s.files, $s.compared, ([double]$s.bytes / 1MB)) 'DarkGray'
+        foreach ($p in @($s.problems)) { if ($p) { Write-Cont "$($p.path): $($p.problem)" 'Red' } }
+    } else {
+        Write-Field 'Sample check' 'none yet: runs after the next backup' 'DarkGray'
+    }
+    $d = if ($st) { $st.data } else { $null }
+    if ($d) {
+        Write-Field 'Data check' ("{0}   {1}, subset {2}" -f "$($d.outcome)".ToUpper(), $d.at, $d.subset) (Get-OutcomeColor $d.outcome)
+        if ($d.problem) { Write-Cont "$($d.problem)" (Get-OutcomeColor $d.outcome) }
+        if ($st.dataCursor) {
+            $done = if ($st.dataCursor.cycleCompletedAt) { $st.dataCursor.cycleCompletedAt } else { 'not yet' }
+            Write-Cont ("next subset {0}/{1}; last full pass {2}" -f $st.dataCursor.next, $st.dataCursor.subsets, $done) 'DarkGray'
+        }
+    } else {
+        Write-Field 'Data check' "none yet: the $VerifyTaskName task, or restic-ctl verify" 'DarkGray'
+    }
+}
+
+function Invoke-Verify {
+    $useSample = $Sample -or ($Rest -contains '--sample')
+    $other = @($Rest | Where-Object { $_ -notin @('--sample', '--data') })
+    if ($other.Count -gt 0) {
+        Write-Host "unknown option: $($other[0])" -ForegroundColor Red
+        exit 2
+    }
+    $backupScript = Join-Path $Base 'restic-backup.ps1'
+    if (-not (Select-String -Path $backupScript -SimpleMatch '[switch]$VerifyData' -Quiet -ErrorAction SilentlyContinue)) {
+        Write-Host ''
+        Write-Fail 'the installed restic-backup.ps1 predates verification'
+        Write-Info 'Bring it up to date:  .\Setup-ResticBackup.ps1 -Update'
+        Write-Host ''
+        exit 1
+    }
+    $rc = 0; $msg = ''
+    if ($useSample) {
+        Write-Head 'Sample check of the latest snapshot'
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $out = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $backupScript -VerifySample 2>&1 |
+                     ForEach-Object { "$_" })
+            $rc = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $prev }
+        $msg = ($out | Where-Object { $_.Trim() }) -join ' '
+    } else {
+        $task = Get-ScheduledTask -TaskName $VerifyTaskName -ErrorAction SilentlyContinue
+        if (-not $task) {
+            Write-Fail "task '$VerifyTaskName' is not registered"
+            Write-Info 'Register it with:  .\Setup-ResticBackup.ps1 -Only 8'
+            Write-Host ''
+            exit 1
+        }
+        Write-Head 'Data check, next subset'
+        Write-Info 'Through the scheduler, as SYSTEM like the scheduled run; waiting for it.'
+        $before = (Get-ScheduledTaskInfo -TaskName $VerifyTaskName).LastRunTime
+        Start-ScheduledTask -TaskName $VerifyTaskName
+        # Wait for it to start (it may refuse: on battery), then for it to finish.
+        $deadline = (Get-Date).AddSeconds(30)
+        while ((Get-Date) -lt $deadline -and
+               (Get-ScheduledTask -TaskName $VerifyTaskName).State -ne 'Running' -and
+               (Get-ScheduledTaskInfo -TaskName $VerifyTaskName).LastRunTime -eq $before) {
+            Start-Sleep -Seconds 1
+        }
+        while ((Get-ScheduledTask -TaskName $VerifyTaskName).State -eq 'Running') { Start-Sleep -Seconds 5 }
+        $info = Get-ScheduledTaskInfo -TaskName $VerifyTaskName
+        if ($info.LastRunTime -eq $before) {
+            Write-Fail 'the task did not start: on battery, or blocked by its conditions'
+            Write-Host ''
+            exit 1
+        }
+        $rc = [int]$info.LastTaskResult
+    }
+    Show-Verification
+    if ($msg) { Write-Host ''; Write-Info $msg }
+    Write-Host ''
+    exit $rc
+}
+
+function Invoke-Unfreeze {
+    Write-Head 'Prune freeze'
+    if (-not (Test-Path $FrozenFile)) {
+        Write-Field 'Prune' 'not frozen' 'Green'
+        Write-Host ''
+        exit 0
+    }
+    Show-Verification
+    Write-Host ''
+    if (-not $Yes) {
+        $answer = Read-Host '    Forget/prune will run again from the next backup. Type UNFREEZE'
+        if ($answer -ne 'UNFREEZE') { Write-Fail 'aborted, still frozen'; Write-Host ''; exit 1 }
+    }
+    Move-Item $FrozenFile "$FrozenFile.cleared" -Force
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') unfreeze: prune allowed again by $env:USERDOMAIN\$env:USERNAME" |
+        Out-File -FilePath $LogFile -Append -Encoding utf8
+    Write-Ok 'prune allowed again from the next backup (kept as prune-frozen.json.cleared)'
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Base 'restic-backup.ps1') -Publish 2>&1
+        if ($LASTEXITCODE -eq 0) { Write-Info 'Home Assistant updated.' }
+    } finally { $ErrorActionPreference = $prev }
+    Write-Host ''
+}
+
 # ============================================================== dispatch
 
 if (-not (Get-Command restic.exe -ErrorAction SilentlyContinue)) {
@@ -1742,4 +1940,6 @@ switch ($Command) {
     'find'      { Invoke-Find }
     'publish'   { Invoke-Publish }
     'unpublish' { Invoke-Publish -Remove }
+    'verify'    { Invoke-Verify }
+    'unfreeze'  { Invoke-Unfreeze }
 }

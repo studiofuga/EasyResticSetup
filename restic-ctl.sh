@@ -15,6 +15,8 @@
 #    log         tail the backup log
 #    config      the effective settings of this machine
 #    publish     send the last result to Home Assistant now (--dry-run: show it)
+#    verify      run the data check now (--sample: the sample check instead)
+#    unfreeze    allow forget/prune again after a check found damage
 #    unpublish   remove this machine from Home Assistant
 #    help        the command list, or the detail for one command
 #
@@ -60,6 +62,7 @@ SUBSET='1/12'
 
 RETRY=''
 PUB_DRY=0
+VERIFY_KIND='data'
 
 # ------------------------------------------------------------------- help
 #
@@ -101,6 +104,9 @@ ACTING
                       --dry-run prints the topic and payload and sends nothing
   unpublish [--dry-run]
                       remove this machine's device and state from Home Assistant
+  verify [--sample]   run the next slice of the data check now, through systemd;
+                      --sample: read back a sample of the latest snapshot instead
+  unfreeze            allow forget/prune again after a check found damage
 
 PASSTHROUGH  (restic itself, with this machine's repository, password file and
               sftp.command already filled in)
@@ -422,6 +428,57 @@ Exit codes: 0 sent (or previewed), 1 the broker did not accept it, 2 Home
 Assistant is not configured.
 T_EOF
         ;;
+    verify) cat <<'T_EOF'
+restic-ctl verify - check that what is in the repository can be read back.
+
+  sudo restic-ctl verify             the next slice of the data check, now
+  sudo restic-ctl verify --sample    a sample of the latest snapshot, read back
+
+Two levels run on their own; this command runs one of them on demand.
+
+Level 1, the sample (--sample). After every backup, up to verify.sampleFiles files
+the new snapshot added or changed (default 8, at most verify.sampleMaxMiB, default
+256 MiB) are read back with "restic dump" and hashed as they stream: nothing is
+written to disk. restic verifies every blob while decrypting, so a dump that
+completes is intact data. A file that has not changed on disk since the snapshot
+started is also compared with the original, which catches "backed up the wrong
+thing". Here it runs against the latest snapshot.
+
+Level 2, the data check (the default). restic-verify.timer runs
+"restic check --read-data-subset=n/N" every day (verify.onCalendar), with n moving
+on after each good run: after N good runs (verify.dataSubsets, default 30) every
+pack in the repository has been downloaded and verified once. Here it goes through
+systemd, like the timer, and waits for the result.
+
+Outcomes: ok; skipped; failed or mismatch - restic or the comparison found damage;
+error - the check could not run (lock held, NAS unreachable), which says nothing
+about the data.
+
+A failed or mismatched check FREEZES the prune: backups go on, but forget/prune is
+skipped until "restic-ctl unfreeze", because pruning rewrites packs and doing that on
+a damaged repository can make it worse. "restic-ctl status" shows the freeze and
+both levels; Home Assistant gets them in the Verification entities.
+
+Costs: --sample, a few seconds and up to 256 MiB. The data check downloads about
+1/N of the repository - for a 126 GiB repository and N=30, ~4 GiB - plus the
+repository metadata, which restic check re-reads without the local cache.
+T_EOF
+        ;;
+    unfreeze) cat <<'T_EOF'
+restic-ctl unfreeze - allow forget/prune again after a check found damage.
+
+  sudo restic-ctl unfreeze [--yes]
+
+A failed or mismatched verification writes /etc/restic/prune-frozen.json, and while
+it exists every backup skips forget/prune. This shows why it was frozen, asks for
+confirmation, removes the file and tells Home Assistant.
+
+Look before unfreezing: "restic-ctl log" for the check's own output, then
+"restic-ctl check --data" for a wider read. If restic reports damaged packs,
+"restic-ctl exec repair packs" / "exec repair snapshots" are restic's own tools; the
+repository is never repaired automatically.
+T_EOF
+        ;;
     unpublish) cat <<'T_EOF'
 restic-ctl unpublish - remove this machine from Home Assistant.
 
@@ -462,7 +519,7 @@ T_EOF
     '') usage ;;
     *)
         echo "No help topic '$1'." >&2
-        echo 'Topics: status snapshots run check schedule history log config publish unpublish exec forget restore unlock ls find' >&2
+        echo 'Topics: status snapshots run check schedule history log config publish unpublish verify unfreeze exec forget restore unlock ls find' >&2
         return 2 ;;
     esac
 }
@@ -471,6 +528,7 @@ CMD_GIVEN=0
 [ $# -gt 0 ] && case "$1" in
     status|snapshots|run|check|schedule|history|log|config) CMD="$1"; CMD_GIVEN=1; shift ;;
     exec|forget|restore|unlock|ls|find|publish|unpublish)   CMD="$1"; CMD_GIVEN=1; shift ;;
+    verify|unfreeze)                                        CMD="$1"; CMD_GIVEN=1; shift ;;
     help)      CMD='help'; CMD_GIVEN=1; shift ;;
     -h|--help) usage; exit 0 ;;
 esac
@@ -503,6 +561,13 @@ while [ $# -gt 0 ]; do
                 publish|unpublish)
                     [ "$1" = '--dry-run' ] || { echo "unknown option: $1" >&2; exit 2; }
                     PUB_DRY=1; shift ;;
+                verify)
+                    case "$1" in
+                        --sample) VERIFY_KIND='sample' ;;
+                        --data)   VERIFY_KIND='data' ;;
+                        *) echo "unknown option: $1" >&2; exit 2 ;;
+                    esac
+                    shift ;;
                 *) echo "unknown option: $1" >&2; exit 2 ;;
             esac ;;
     esac
@@ -721,6 +786,8 @@ print("%d|%d|%d|%s" % (len(runs), len(bad), len(warn),
             [ -n "$lastbad" ] && cont "last failure $lastbad" "$C_ERR"
         fi
     fi
+
+    show_verification
 
     head_ 'Scheduler'
     if ! systemctl list-unit-files "$TIMER" >/dev/null 2>&1 || \
@@ -1073,9 +1140,15 @@ cmd_config() {
         field 'Home Assistant' 'not configured' "$C_DIM"
     fi
 
+    vf="$(cfg verify.sampleFiles)"; vm="$(cfg verify.sampleMaxMiB)"
+    vn="$(cfg verify.dataSubsets)"; vc="$(cfg verify.onCalendar)"
+    field 'Verification' "sample ${vf:-8} files / ${vm:-256} MiB after each backup"
+    cont "data check 1/${vn:-30} of the repository, ${vc:-*-*-* 15:00}"
+
     head_ 'Files'
     for pair in "Log:$LOG" "Excludes:$EXCLUDE_FILE" "Password:$RESTIC_PASSWORD_FILE" \
                 "MQTT password:$BASE/mqtt-password" \
+                "Verify state:$BASE/verify-state.json" "Prune frozen:$BASE/prune-frozen.json" \
                 "Last run:$LAST_RUN" "History:$HISTORY" "Progress:$PROGRESS"; do
         label="${pair%%:*}"; path="${pair#*:}"
         if [ -f "$path" ]; then
@@ -1496,6 +1569,117 @@ cmd_publish() {
     exit "$rc"
 }
 
+# ============================================================ verification
+
+VERIFY_STATE="$BASE/verify-state.json"
+FROZEN="$BASE/prune-frozen.json"
+VERIFY_SERVICE='restic-verify.service'
+
+# Lines of "label|value|colour-name" from verify-state.json and prune-frozen.json,
+# so the shell only formats.
+verification_lines() {
+    python3 - "$VERIFY_STATE" "$FROZEN" <<'VL_EOF'
+import json, sys
+def load(p):
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+st, frozen = load(sys.argv[1]) or {}, load(sys.argv[2])
+def col(o):
+    return {"ok": "ok", "skipped": "dim", "error": "warn"}.get(o, "err")
+if frozen:
+    print("Prune|FROZEN since %s|err" % frozen.get("since", "?"))
+    print("|%s|err" % frozen.get("reason", ""))
+    print("|after a look: sudo restic-ctl unfreeze|warn")
+s = st.get("sample")
+if s:
+    print("Sample check|%s   %s, snapshot %s|%s" % (s.get("outcome", "?").upper(), s.get("at", "?"),
+                                                  s.get("snapshotId", "?"), col(s.get("outcome"))))
+    print("|%s files read back, %s compared with the original, %.1f MiB|dim"
+          % (s.get("files", 0), s.get("compared", 0), (s.get("bytes") or 0) / 1048576))
+    for p in s.get("problems") or []:
+        print("|%s: %s|err" % (p.get("path"), p.get("problem")))
+else:
+    print("Sample check|none yet: runs after the next backup|dim")
+d = st.get("data")
+cur = st.get("dataCursor") or {}
+if d:
+    print("Data check|%s   %s, subset %s|%s" % (d.get("outcome", "?").upper(), d.get("at", "?"),
+                                                d.get("subset", "?"), col(d.get("outcome"))))
+    if d.get("problem"):
+        print("|%s|%s" % (d["problem"], col(d.get("outcome"))))
+    if cur:
+        print("|next subset %s/%s; last full pass %s|dim"
+              % (cur.get("next"), cur.get("subsets"), cur.get("cycleCompletedAt") or "not yet"))
+else:
+    print("Data check|none yet: restic-verify.timer, or restic-ctl verify|dim")
+VL_EOF
+}
+
+show_verification() {
+    head_ 'Verification'
+    verification_lines 2>/dev/null | while IFS='|' read -r label value colour; do
+        case "$colour" in
+            ok) c="$C_OK" ;; warn) c="$C_WARN" ;; err) c="$C_ERR" ;; dim) c="$C_DIM" ;; *) c="$C_OFF" ;;
+        esac
+        if [ -n "$label" ]; then field "$label" "$value" "$c"; else cont "$value" "$c"; fi
+    done
+}
+
+cmd_verify() {
+    script='/usr/local/bin/restic-backup.sh'
+    if ! grep -q -- '--verify-data' "$script" 2>/dev/null; then
+        fail 'the installed restic-backup.sh predates verification'
+        info 'Bring it up to date:  sudo ./setup-restic-backup.sh --update'
+        printf '\n'; exit 1
+    fi
+    if [ "$VERIFY_KIND" = 'sample' ]; then
+        head_ 'Sample check of the latest snapshot'
+        out="$("$script" --verify-sample 2>&1)"; rc=$?
+    else
+        if ! systemctl cat "$VERIFY_SERVICE" >/dev/null 2>&1; then
+            fail "$VERIFY_SERVICE is not installed"
+            info 'Install it with:  sudo ./setup-restic-backup.sh --only 8'
+            printf '\n'; exit 1
+        fi
+        head_ 'Data check, next subset'
+        info 'Through systemd, like the timer; this waits for it to finish.'
+        systemctl start "$VERIFY_SERVICE"; rc=$?
+        if [ "$(systemctl show -p ConditionResult --value "$VERIFY_SERVICE")" = 'no' ]; then
+            fail 'not run: on battery (ConditionACPower). Plug in and try again.'
+            printf '\n'; exit 1
+        fi
+        out=''
+    fi
+    show_verification
+    [ -n "$out" ] && { printf '\n'; info "$out"; }
+    printf '\n'
+    exit "$rc"
+}
+
+cmd_unfreeze() {
+    head_ 'Prune freeze'
+    if [ ! -f "$FROZEN" ]; then
+        field 'Prune' 'not frozen' "$C_OK"
+        printf '\n'; exit 0
+    fi
+    show_verification
+    printf '\n'
+    if [ "$YES" != 1 ]; then
+        printf '    Forget/prune will run again from the next backup. Type UNFREEZE: '
+        read -r answer
+        [ "$answer" = 'UNFREEZE' ] || { fail 'aborted, still frozen'; printf '\n'; exit 1; }
+    fi
+    mv -f "$FROZEN" "$FROZEN.cleared" && \
+        printf '%s unfreeze: prune allowed again by %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
+               "${SUDO_USER:-root}" >> "$LOG"
+    ok 'prune allowed again from the next backup (kept as prune-frozen.json.cleared)'
+    /usr/local/bin/restic-backup.sh --publish >/dev/null 2>&1 && info 'Home Assistant updated.'
+    printf '\n'
+}
+
 # ============================================================== dispatch
 
 case "$CMD" in
@@ -1514,4 +1698,6 @@ case "$CMD" in
     ls)        cmd_ls ;;
     find)      cmd_find ;;
     publish|unpublish) cmd_publish ;;
+    verify)    cmd_verify ;;
+    unfreeze)  cmd_unfreeze ;;
 esac

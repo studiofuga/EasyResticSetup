@@ -22,6 +22,9 @@ id_ed25519*
 known_hosts
 progress.json
 last-run.json
+verify-state.json
+prune-frozen.json*
+manifest/
 history.jsonl
 excludes.txt
 excludes.txt.bak

@@ -5,7 +5,7 @@
 | **`RUNBOOK.md`** | **Start here.** Architecture, per-machine procedure, how to do things, troubleshooting, and why things are the way they are. |
 | **`COMMANDS.md`** | The reference: every command and option of every script, Windows and Linux together. |
 | `HOME-ASSISTANT.md` | What each machine reports over MQTT, the broker ACL, and the fleet-wide lines on the Home Assistant side. |
-| `restic-ctl.ps1` / `restic-ctl.sh` | Day-to-day driver: `status`, `snapshots`, `run`, `check`, `schedule`, `history`, `log`, `config`, `publish`, `unpublish`, `help`, plus a restic wrapper: `exec`, `forget`, `restore`, `ls`, `find`, `unlock` |
+| `restic-ctl.ps1` / `restic-ctl.sh` | Day-to-day driver: `status`, `snapshots`, `run`, `check`, `schedule`, `history`, `log`, `config`, `publish`, `verify`, `unfreeze`, `unpublish`, `help`, plus a restic wrapper: `exec`, `forget`, `restore`, `ls`, `find`, `unlock` |
 | `nas-fleet-status.sh` | All machines at a glance; run on the NAS, uses no passwords |
 | `Setup-ResticBackup.ps1` | Windows client installer, 9 idempotent steps |
 | `setup-restic-backup.sh` | Linux client installer, same 9 steps |
