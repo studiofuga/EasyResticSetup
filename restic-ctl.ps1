@@ -19,6 +19,7 @@
       unpublish   remove this machine from Home Assistant
       verify      run the data check now (-Sample: the sample check instead)
       unfreeze    allow forget/prune again after a check found damage
+      exclude     tag a folder so no backup includes it (no elevation needed)
       help        the command list, or the detail for one command
 
     And, as a wrapper over restic itself, so the repository, the password file
@@ -78,7 +79,7 @@ param(
     [Parameter(Position = 0)]
     [ValidateSet('status', 'snapshots', 'run', 'check', 'schedule', 'history', 'log',
                  'config', 'exec', 'forget', 'restore', 'unlock', 'ls', 'find', 'publish',
-                 'unpublish', 'verify', 'unfreeze', 'help')]
+                 'unpublish', 'verify', 'unfreeze', 'exclude', 'help')]
     [string] $Command = 'status',
 
     [string] $Base   = 'C:\ProgramData\restic',
@@ -97,6 +98,7 @@ param(
     [switch] $Help,          # same as the help command, so -Help works anywhere
     [switch] $DryRun,        # publish, unpublish: print the messages, send nothing
     [switch] $Sample,        # verify: the sample check instead of the data check
+    [switch] $Remove,        # exclude: take the tag back
                              # (--dry-run, the Linux spelling, works too)
 
     # schedule: 0 means "leave whatever is stored alone". The three of them used to be
@@ -115,7 +117,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$CtlVersion = '2026.10.01.1'
+$CtlVersion = '2026.10.02.2'
 
 # Which parameters were actually typed. "schedule -TimeLimitHours 0" has to be told
 # apart from "schedule" with the default still sitting there.
@@ -165,6 +167,9 @@ ACTING
   verify [-Sample]    run the next slice of the data check now, through the
                       scheduler; -Sample: read back a sample of the latest snapshot
   unfreeze            allow forget/prune again after a check found damage
+  exclude <dir>...    leave a folder out of every backup, wherever it moves, by
+                      writing a CACHEDIR.TAG into it; -Remove takes it back.
+                      Works from a normal, non-elevated shell
 
 PASSTHROUGH  (restic itself, with this machine's repository, password file and
               sftp.command already filled in)
@@ -496,6 +501,34 @@ a damaged repository can make it worse. "restic-ctl status" shows the freeze and
 both levels; Home Assistant gets them in the Verification entities.
 '@
 
+$HelpTopics['exclude'] = @'
+restic-ctl exclude - leave a folder out of every backup, wherever it moves.
+
+  restic-ctl exclude <dir>...            tag the folders
+  restic-ctl exclude -Remove <dir>...    take the tag back (--remove works too)
+
+Writes a CACHEDIR.TAG into each folder. The backup runs with --exclude-caches, so a
+folder holding a valid tag is skipped with everything under it, and the tag moves
+with the folder: no pattern in excludes.txt to keep in step with it.
+
+"Valid" means the file starts with the line
+  Signature: 8a477f597d28d172789f06886806bc55
+which is what the Cache Directory Tagging standard (bford.info/cachedir) requires,
+so that a file that merely has that name excludes nothing. Other tools honour it
+too, which also means the folder is declared a cache to all of them.
+
+No elevation needed: it only writes a small file into a folder you can write to.
+
+-Remove deletes only tags this command wrote. A CACHEDIR.TAG written by another
+program is left alone and reported.
+
+Takes effect from the next backup. What earlier snapshots hold stays there until
+retention lets it go. The alternative marker is an empty .nobackup file, which only
+these scripts recognise.
+
+  restic-ctl exclude "C:\Users\me\Projects\big\Download"
+'@
+
 $HelpTopics['unfreeze'] = @'
 restic-ctl unfreeze - allow forget/prune again after a check found damage.
 
@@ -589,6 +622,69 @@ function Show-Help([string]$Topic) {
 if ($Help -or $Command -eq 'help') {
     Show-Help ($Rest | Select-Object -First 1)
     exit 0
+}
+
+# ------------------------------------------------------------------ exclude
+#
+# Before config.json is read: tagging a folder you can write to needs no elevation,
+# and this is the one command meant to be run from a normal shell.
+if ($Command -eq 'exclude') {
+    $signature = 'Signature: 8a477f597d28d172789f06886806bc55'
+    $mark = '# Written by restic-ctl exclude: this folder is left out of restic backups.'
+    $undo = $Remove -or ($Rest -contains '--remove')
+    $dirs = @($Rest | Where-Object { $_ -ne '--remove' })
+    if ($dirs.Count -eq 0) {
+        Write-Host 'Usage: restic-ctl exclude [-Remove] <dir>...' -ForegroundColor Red
+        exit 2
+    }
+    $rc = 0
+    foreach ($d in $dirs) {
+        $item = Get-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
+        if (-not $item -or -not $item.PSIsContainer) {
+            Write-Host "    FAIL  $($d): not a folder" -ForegroundColor Red; $rc = 1; continue
+        }
+        $abs = $item.FullName
+        $tag = Join-Path $abs 'CACHEDIR.TAG'
+        $content = $null
+        if (Test-Path -LiteralPath $tag) {
+            try { $content = [System.IO.File]::ReadAllText($tag) } catch { $content = '' }
+        }
+        if ($undo) {
+            if ($null -eq $content) {
+                Write-Host "    OK    $($abs): not tagged" -ForegroundColor Green
+            } elseif ($content.Contains($mark)) {
+                try {
+                    Remove-Item -LiteralPath $tag -Force -ErrorAction Stop
+                    Write-Host "    OK    $($abs): tag removed, backed up again from the next run" -ForegroundColor Green
+                } catch {
+                    Write-Host "    FAIL  $($abs): cannot remove $($tag)" -ForegroundColor Red; $rc = 1
+                }
+            } else {
+                Write-Host "    WARN  $($abs): its CACHEDIR.TAG was written by another program; left alone" -ForegroundColor Yellow
+                $rc = 1
+            }
+            continue
+        }
+        if ($null -ne $content) {
+            if ($content.StartsWith($signature)) {
+                Write-Host "    OK    $($abs): already excluded (valid CACHEDIR.TAG)" -ForegroundColor Green
+            } else {
+                Write-Host "    FAIL  $($abs): has a CACHEDIR.TAG without the signature; not touching it" -ForegroundColor Red
+                $rc = 1
+            }
+            continue
+        }
+        try {
+            # ASCII through .NET, not Set-Content: Windows PowerShell's UTF-8 adds a byte
+            # order mark, and then the file no longer starts with the signature.
+            [System.IO.File]::WriteAllText($tag, "$signature`n$mark`n", [System.Text.Encoding]::ASCII)
+            Write-Host "    OK    $($abs): excluded from the next backup on" -ForegroundColor Green
+        } catch {
+            Write-Host "    FAIL  $($abs): cannot write $($tag): $($_.Exception.Message)" -ForegroundColor Red
+            $rc = 1
+        }
+    }
+    exit $rc
 }
 
 # ---------------------------------------------------------------- settings

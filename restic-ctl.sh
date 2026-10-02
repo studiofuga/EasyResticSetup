@@ -17,6 +17,7 @@
 #    publish     send the last result to Home Assistant now (--dry-run: show it)
 #    verify      run the data check now (--sample: the sample check instead)
 #    unfreeze    allow forget/prune again after a check found damage
+#    exclude     tag a folder so no backup includes it (no sudo needed)
 #    unpublish   remove this machine from Home Assistant
 #    help        the command list, or the detail for one command
 #
@@ -43,6 +44,9 @@
 # =============================================================================
 set -u
 
+# Same stamp as the installers and restic-ctl.ps1: the version of the whole set.
+CTL_VERSION='2026.10.02.2'
+
 BASE='/etc/restic'
 SERVICE='restic-backup.service'
 TIMER='restic-backup.timer'
@@ -63,6 +67,8 @@ SUBSET='1/12'
 RETRY=''
 PUB_DRY=0
 VERIFY_KIND='data'
+EXCL_REMOVE=0
+EXCL_DIRS=()
 
 # ------------------------------------------------------------------- help
 #
@@ -107,6 +113,9 @@ ACTING
   verify [--sample]   run the next slice of the data check now, through systemd;
                       --sample: read back a sample of the latest snapshot instead
   unfreeze            allow forget/prune again after a check found damage
+  exclude <dir>...    leave a folder out of every backup, wherever it moves, by
+                      writing a CACHEDIR.TAG into it; --remove takes it back.
+                      Works without sudo on folders you own
 
 PASSTHROUGH  (restic itself, with this machine's repository, password file and
               sftp.command already filled in)
@@ -464,6 +473,37 @@ Costs: --sample, a few seconds and up to 256 MiB. The data check downloads about
 repository metadata, which restic check re-reads without the local cache.
 T_EOF
         ;;
+    exclude) cat <<'T_EOF'
+restic-ctl exclude - leave a folder out of every backup, wherever it moves.
+
+  restic-ctl exclude <dir>...            tag the folders
+  restic-ctl exclude --remove <dir>...   take the tag back
+
+Writes a CACHEDIR.TAG into each folder. The backup runs with --exclude-caches, so a
+folder holding a valid tag is skipped with everything under it, and the tag moves
+with the folder: no pattern in excludes.txt to keep in step with it.
+
+"Valid" means the file starts with the line
+  Signature: 8a477f597d28d172789f06886806bc55
+which is what the Cache Directory Tagging standard (bford.info/cachedir) requires,
+so that a file that merely has that name excludes nothing. Other tools honour it
+too - tar --exclude-caches, borg, several cleaners - which is the point of a
+standard, and also means the folder is declared a cache to all of them.
+
+No sudo needed: it only writes a small file into a folder you can write to. Run with
+sudo, the tag is given to the folder's owner, so they can remove it later.
+
+--remove deletes only tags this command wrote. A CACHEDIR.TAG written by another
+program (cargo, a browser, ...) is left alone and reported.
+
+Takes effect from the next backup. What earlier snapshots hold stays there until
+retention lets it go. The alternative marker is an empty .nobackup file, which only
+these scripts recognise.
+
+  restic-ctl exclude ~/projects/big/Download
+  sudo restic-backup.sh --dry-run          to see the effect
+T_EOF
+        ;;
     unfreeze) cat <<'T_EOF'
 restic-ctl unfreeze - allow forget/prune again after a check found damage.
 
@@ -519,7 +559,7 @@ T_EOF
     '') usage ;;
     *)
         echo "No help topic '$1'." >&2
-        echo 'Topics: status snapshots run check schedule history log config publish unpublish verify unfreeze exec forget restore unlock ls find' >&2
+        echo 'Topics: status snapshots run check schedule history log config publish unpublish verify unfreeze exclude exec forget restore unlock ls find' >&2
         return 2 ;;
     esac
 }
@@ -528,7 +568,7 @@ CMD_GIVEN=0
 [ $# -gt 0 ] && case "$1" in
     status|snapshots|run|check|schedule|history|log|config) CMD="$1"; CMD_GIVEN=1; shift ;;
     exec|forget|restore|unlock|ls|find|publish|unpublish)   CMD="$1"; CMD_GIVEN=1; shift ;;
-    verify|unfreeze)                                        CMD="$1"; CMD_GIVEN=1; shift ;;
+    verify|unfreeze|exclude)                                CMD="$1"; CMD_GIVEN=1; shift ;;
     help)      CMD='help'; CMD_GIVEN=1; shift ;;
     -h|--help) usage; exit 0 ;;
 esac
@@ -561,6 +601,10 @@ while [ $# -gt 0 ]; do
                 publish|unpublish)
                     [ "$1" = '--dry-run' ] || { echo "unknown option: $1" >&2; exit 2; }
                     PUB_DRY=1; shift ;;
+                exclude)
+                    # An array, not REST: folder names can contain spaces.
+                    if [ "$1" = '--remove' ]; then EXCL_REMOVE=1; else EXCL_DIRS+=("$1"); fi
+                    shift ;;
                 verify)
                     case "$1" in
                         --sample) VERIFY_KIND='sample' ;;
@@ -579,6 +623,64 @@ if [ "$CMD" = 'help' ]; then
     help_topic "$(printf '%s' "$REST" | awk '{print $1}')" || exit 2
     exit 0
 fi
+
+# ================================================================ exclude
+#
+# Before the root check and before config.json is read: tagging a folder you own
+# needs neither, and it is the one command meant to be run without sudo.
+CACHEDIR_SIGNATURE='Signature: 8a477f597d28d172789f06886806bc55'
+CACHEDIR_MARK='# Written by restic-ctl exclude: this folder is left out of restic backups.'
+
+cmd_exclude() {
+    if [ "${#EXCL_DIRS[@]}" -eq 0 ]; then
+        echo 'Usage: restic-ctl exclude [--remove] <dir>...' >&2
+        exit 2
+    fi
+    rc=0
+    for d in "${EXCL_DIRS[@]}"; do
+        if [ ! -d "$d" ]; then
+            printf '    FAIL  %s: not a folder\n' "$d"; rc=1; continue
+        fi
+        abs="$(cd "$d" && pwd -P)"
+        tag="$abs/CACHEDIR.TAG"
+        if [ "$EXCL_REMOVE" = 1 ]; then
+            if [ ! -e "$tag" ]; then
+                printf '    OK    %s: not tagged\n' "$abs"
+            elif grep -qxF "$CACHEDIR_MARK" "$tag" 2>/dev/null; then
+                if rm -f "$tag"; then
+                    printf '    OK    %s: tag removed, backed up again from the next run\n' "$abs"
+                else
+                    printf '    FAIL  %s: cannot remove %s\n' "$abs" "$tag"; rc=1
+                fi
+            else
+                printf '    WARN  %s: its CACHEDIR.TAG was written by another program; left alone\n' "$abs"
+                rc=1
+            fi
+            continue
+        fi
+        if [ -e "$tag" ]; then
+            if [ "$(head -c ${#CACHEDIR_SIGNATURE} "$tag" 2>/dev/null)" = "$CACHEDIR_SIGNATURE" ]; then
+                printf '    OK    %s: already excluded (valid CACHEDIR.TAG)\n' "$abs"
+            else
+                printf '    FAIL  %s: has a CACHEDIR.TAG without the signature; not touching it\n' "$abs"
+                rc=1
+            fi
+            continue
+        fi
+        if printf '%s\n%s\n' "$CACHEDIR_SIGNATURE" "$CACHEDIR_MARK" > "$tag" 2>/dev/null; then
+            # Under sudo, hand the tag to the folder's owner, so they can remove it.
+            [ "$(id -u)" = 0 ] && chown "$(stat -c '%u:%g' "$abs")" "$tag"
+            chmod 644 "$tag"
+            printf '    OK    %s: excluded from the next backup on\n' "$abs"
+        else
+            printf '    FAIL  %s: cannot write %s (not your folder? try sudo)\n' "$abs" "$tag"
+            rc=1
+        fi
+    done
+    exit "$rc"
+}
+
+[ "$CMD" = 'exclude' ] && cmd_exclude
 
 CONFIG="$BASE/config.json"
 LEGACY_ENV="$BASE/settings.env"

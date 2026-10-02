@@ -23,6 +23,7 @@ command take".
     [log](#restic-ctl-log) · [config](#restic-ctl-config) ·
     [publish](#restic-ctl-publish) · [unpublish](#restic-ctl-unpublish) ·
     [verify](#restic-ctl-verify) · [unfreeze](#restic-ctl-unfreeze) ·
+    [exclude](#restic-ctl-exclude) ·
     [help](#restic-ctl-help)
   - [exec](#restic-ctl-exec) · [forget](#restic-ctl-forget) ·
     [restore](#restic-ctl-restore) · [unlock](#restic-ctl-unlock) ·
@@ -108,6 +109,7 @@ also run `.\restic-ctl.ps1` or `./restic-ctl.sh` directly.
 | Read back a sample of the latest snapshot | `restic-ctl verify -Sample` | `sudo restic-ctl verify --sample` |
 | Run today's data check now | `restic-ctl verify` | `sudo restic-ctl verify` |
 | Prune again after a check found damage | `restic-ctl unfreeze` | `sudo restic-ctl unfreeze` |
+| Leave a folder out, wherever it moves | `restic-ctl exclude <dir>` | `restic-ctl exclude <dir>` (no sudo) |
 | Install or repair | `.\Setup-ResticBackup.ps1` | `sudo ./setup-restic-backup.sh` |
 | Update to newer scripts | `.\Setup-ResticBackup.ps1 -Update` | `sudo ./setup-restic-backup.sh --update` |
 | Whole fleet, from the NAS | `sudo sh nas-fleet-status.sh` (on the NAS) | same |
@@ -464,6 +466,29 @@ After a check found damage, every backup skips forget/prune while `prune-frozen.
 exists. This shows why it was frozen, asks you to type `UNFREEZE` (`--yes` skips it),
 keeps the file as `prune-frozen.json.cleared`, logs who did it, and updates Home
 Assistant. Investigate first: *When a check finds damage* in `RUNBOOK.md`.
+
+### `restic-ctl exclude`
+
+```
+restic-ctl exclude [-Remove] <dir>...        (--remove works too)
+restic-ctl exclude [--remove] <dir>...       no sudo needed
+```
+
+Writes a `CACHEDIR.TAG` into each folder, so every later backup skips it with
+everything under it (`--exclude-caches`), and the tag moves with the folder. The file
+starts with the line the Cache Directory Tagging standard requires,
+`Signature: 8a477f597d28d172789f06886806bc55`, so a file that merely has that name
+excludes nothing; other tools that honour the standard (tar, borg, some cleaners) will
+skip the folder too.
+
+The one command that needs no root or elevation: it runs before `config.json` is read
+and only writes into a folder you can write to. Under `sudo` on Linux the tag is
+handed to the folder's owner. `--remove` deletes only tags this command wrote; a tag
+from another program is reported and left alone. A folder with an existing tag that
+lacks the signature is not touched.
+
+Exit codes: 0 every folder done, 1 at least one could not be, 2 no folder given. The
+alternative marker is an empty `.nobackup`, which only these scripts recognise.
 
 ### `restic-ctl help`
 

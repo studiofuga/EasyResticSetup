@@ -400,7 +400,9 @@ New-Item C:\Users\me\some\Download\.nobackup
 
 `restic-backup.sh --dry-run` / `restic-backup.ps1 -DryRun` shows the effect. Remove
 the file and the folder is backed up again from the next run. The same goes for a
-folder with a valid `CACHEDIR.TAG`, which many tools write into their caches.
+folder with a valid `CACHEDIR.TAG`, which many tools write into their caches;
+`restic-ctl exclude <dir>` writes one for you, without sudo, and `--remove` takes it
+back.
 
 This is the only genuinely per-machine work. The defaults cover browser caches,
 package caches and build output, but each machine has its own large
