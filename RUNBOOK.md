@@ -388,6 +388,20 @@ The consequence is worth stating plainly, because it is a real reduction in
 coverage: **for those folders the service is the backup.** A file deleted and
 purged there has no restic snapshot behind it.
 
+**One folder, wherever it lives: `.nobackup`.** A folder that contains a file named
+`.nobackup` is left out of the backup with everything under it, wherever it is and
+wherever it is moved later - no pattern in `excludes.txt` to keep in step with it.
+The file can be empty:
+
+```
+touch ~/some/project/Download/.nobackup
+New-Item C:\Users\me\some\Download\.nobackup
+```
+
+`restic-backup.sh --dry-run` / `restic-backup.ps1 -DryRun` shows the effect. Remove
+the file and the folder is backed up again from the next run. The same goes for a
+folder with a valid `CACHEDIR.TAG`, which many tools write into their caches.
+
 This is the only genuinely per-machine work. The defaults cover browser caches,
 package caches and build output, but each machine has its own large
 re-creatable directories.

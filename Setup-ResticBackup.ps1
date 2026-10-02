@@ -196,7 +196,7 @@ $ErrorActionPreference = 'Stop'
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-$ScriptVersion = '2026.10.01.1'
+$ScriptVersion = '2026.10.02.1'
 
 # Which parameters the caller actually typed, as opposed to the ones that fell back
 # to a default. This is the whole basis of the configuration handling below: a
@@ -1166,6 +1166,8 @@ Host $HostAlias
         Write-TextFile $ExcludeFile @'
 # Absolute patterns use Windows paths; bare names match at any depth.
 # Check the effect with:  .\restic-backup.ps1 -DryRun
+# To leave out one folder wherever it ends up, put an empty .nobackup file in it
+# instead of a pattern here:  New-Item <folder>\.nobackup
 
 # =============================================================================
 #  Virtual machine disk images
@@ -2413,7 +2415,11 @@ $null = Invoke-Restic @('unlock')
 
 Write-Manifest
 
+# --exclude-if-present .nobackup: a folder holding a file of that name is left out,
+# wherever it is. The marker travels with the folder, so excluding something that may
+# move needs no edit of excludes.txt.
 $backupArgs = @('backup', '--json', '--use-fs-snapshot', '--exclude-caches',
+                '--exclude-if-present', '.nobackup',
                 '--exclude-file', (Join-Path $Base 'excludes.txt'), '--tag', 'scheduled')
 if ($DryRun) { $backupArgs += '--dry-run' }
 $backupArgs += Get-RunPaths

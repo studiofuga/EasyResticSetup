@@ -794,6 +794,10 @@ It reads everything from `config.json` and writes the log, `progress.json`,
 is why it needs to run elevated. On both it asks the OS not to sleep while it works —
 Windows through the Power Request API, Linux through `systemd-inhibit --what=idle`.
 
+Besides `excludes.txt`, a run leaves out every folder that contains a file named
+`.nobackup` (`--exclude-if-present .nobackup`) or a valid `CACHEDIR.TAG`
+(`--exclude-caches`): a per-folder marker that moves with the folder.
+
 A normal run, in order: clear stale locks; write the package manifest (`manifest/`,
 added to the backup paths when they do not already cover it); back up; record the
 outcome; read back a sample of the new snapshot; then forget/prune - unless

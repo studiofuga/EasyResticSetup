@@ -30,7 +30,7 @@ set -u
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-SCRIPT_VERSION='2026.10.01.1'
+SCRIPT_VERSION='2026.10.02.1'
 
 # ---- defaults ---------------------------------------------------------------
 # No default on purpose: nothing site-specific is baked into this script. The NAS
@@ -832,6 +832,8 @@ EOF
         cat > "$EXCLUDE_FILE" <<'EOF'
 # Absolute patterns anchor to /; bare names match at any depth.
 # Check the effect with:  restic-backup.sh --dry-run
+# To leave out one folder wherever it ends up, put an empty .nobackup file in it
+# instead of a pattern here:  touch <folder>/.nobackup
 
 # =============================================================================
 #  Virtual machine disk images
@@ -1901,12 +1903,17 @@ RUN_PATHS="$(manifest_backup_paths)"
 
 rm -f "$PROGRESS.summary"
 set -o pipefail
+# --exclude-if-present .nobackup: a folder holding a file of that name is left out,
+# wherever it is. The marker travels with the folder, so excluding something that
+# may move needs no edit of excludes.txt.
 # shellcheck disable=SC2086
 if [ "$MODE" = 'dryrun' ]; then
     restic -o "sftp.command=$SFTP_COMMAND" backup --json --dry-run --exclude-caches \
+        --exclude-if-present .nobackup \
         --exclude-file "$EXCLUDE_FILE" --tag scheduled $RUN_PATHS 2>&1 | filter_json_progress
 else
     restic -o "sftp.command=$SFTP_COMMAND" backup --json --exclude-caches \
+        --exclude-if-present .nobackup \
         --exclude-file "$EXCLUDE_FILE" --tag scheduled $RUN_PATHS 2>&1 | filter_json_progress
 fi
 rc=$?
