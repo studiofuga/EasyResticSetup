@@ -45,7 +45,7 @@
 set -u
 
 # Same stamp as the installers and restic-ctl.ps1: the version of the whole set.
-CTL_VERSION='2026.10.02.2'
+CTL_VERSION='2026.10.09.2'
 
 BASE='/etc/restic'
 SERVICE='restic-backup.service'
@@ -66,6 +66,7 @@ SUBSET='1/12'
 
 RETRY=''
 PUB_DRY=0
+LOG_WHICH=''
 VERIFY_KIND='data'
 EXCL_REMOVE=0
 EXCL_DIRS=()
@@ -94,7 +95,8 @@ READING  (fast - local files and repository metadata, no data transfer)
   snapshots           what the repository holds: the list, the age of the newest,
                       totals
   history             table of recent runs, the failed ones included
-  log                 the tail of the backup log
+  log                 the tail of the backup log; --run: the whole last run,
+                      --problem: the last run that did not end ok
   config              this machine's effective settings and where they live
   schedule            when the backup runs, stored intent vs installed timer
 
@@ -131,6 +133,7 @@ OPTIONS
                       --data); takes 1/12 or 5%
   --count N           history, log: how many entries (default 15)
   --follow            log: keep watching
+  --run, --problem    log: the last run's own log, or the last problem run's
   --no-wait           run: start the service and return instead of following it
   --yes               forget: skip the confirmation prompt
   --target DIR        restore: where to restore to (required)
@@ -287,14 +290,27 @@ T_EOF
     log) cat <<'T_EOF'
 restic-ctl log - the backup log.
 
-  sudo restic-ctl log [--count N] [--follow]
+  sudo restic-ctl log [--count N] [--follow]   the tail of the whole log
+  sudo restic-ctl log --run                    the last backup run, all of it
+  sudo restic-ctl log --problem                the last run that did not end ok
 
-The tail of /var/log/restic-backup.log, written by the backup script on every
-run. --follow keeps watching, for a backup in progress.
+The log, /var/log/restic-backup.log, is written by the backup script on every
+run, checks included. --follow keeps watching, for a backup in progress.
+
+At the end of every backup the script also keeps that run's own part of it:
+  /etc/restic/last-run.log       the last run, whatever its outcome
+  /etc/restic/last-problem.log   the last run that did not end ok - failed,
+                                 warnings, prune-failed - kept until the next
+                                 such run, so a good run afterwards does not
+                                 take the evidence away
+--run and --problem print those, whole, with the diagnosis on top. The same
+diagnosis is in "status" and in Home Assistant; last-run.log is also on the
+broker, retained, on restic/<box>/log.
 
 For a running backup, "status" is usually the better view: the log records what
 happened at each stage, while progress.json carries the live counters. For what
-systemd itself thinks, "journalctl -u restic-backup.service" is the other half.
+systemd itself thinks, "journalctl -u restic-backup.service" is the other half:
+it is where the script's own errors go if it dies before writing its record.
 T_EOF
         ;;
     config) cat <<'T_EOF'
@@ -412,15 +428,19 @@ restic-ctl publish - send this machine's backup state to Home Assistant.
   sudo restic-ctl publish             send it now
   sudo restic-ctl publish --dry-run   print the topics and the payloads, send nothing
 
-The same two messages the backup sends at the end of every run, over MQTT with QoS 1
-and the retain flag, to the broker in the homeAssistant section of config.json:
+The same three messages the backup sends at the end of every run, over MQTT with
+QoS 1 and the retain flag, to the broker in the homeAssistant section of config.json:
 
   homeassistant/device/restic/<id>/config
         MQTT discovery. Home Assistant creates the device and its entities from
         it, so nothing is configured on the HA side for each machine.
   restic/<box>
         the state: last-run.json plus "box" and "publishedAt". A machine that has
-        never run a backup sends outcome "never".
+        never run a backup sends outcome "never". After a run that did not end ok
+        it carries the diagnosis: phase, reason, message, hint, logTail.
+  restic/<box>/log
+        last-run.log, the last run's own log, as plain text. No entity reads it;
+        read it with any MQTT client. Not sent until a backup has written it.
 
 Use it to check the broker settings without waiting for a backup, or to put a
 machine's state back after the retained message was cleared on the broker.
@@ -523,10 +543,10 @@ T_EOF
 restic-ctl unpublish - remove this machine from Home Assistant.
 
   sudo restic-ctl unpublish             remove it now
-  sudo restic-ctl unpublish --dry-run   print the two topics it would clear
+  sudo restic-ctl unpublish --dry-run   print the three topics it would clear
 
-Sends an empty retained message to both topics publish uses. Home Assistant removes
-the device and its entities, and the broker forgets the last state.
+Sends an empty retained message to the three topics publish uses. Home Assistant
+removes the device and its entities, and the broker forgets the last state and log.
 
 The next backup announces the machine again. To retire it, stop the timer first,
 then unpublish:
@@ -601,6 +621,13 @@ while [ $# -gt 0 ]; do
                 publish|unpublish)
                     [ "$1" = '--dry-run' ] || { echo "unknown option: $1" >&2; exit 2; }
                     PUB_DRY=1; shift ;;
+                log)
+                    case "$1" in
+                        --run)     LOG_WHICH='run' ;;
+                        --problem) LOG_WHICH='problem' ;;
+                        *) echo "unknown option: $1" >&2; exit 2 ;;
+                    esac
+                    shift ;;
                 exclude)
                     # An array, not REST: folder names can contain spaces.
                     if [ "$1" = '--remove' ]; then EXCL_REMOVE=1; else EXCL_DIRS+=("$1"); fi
@@ -688,6 +715,8 @@ LOG='/var/log/restic-backup.log'
 PROGRESS="$BASE/progress.json"
 LAST_RUN="$BASE/last-run.json"
 HISTORY="$BASE/history.jsonl"
+RUN_LOG="$BASE/last-run.log"
+PROBLEM_LOG="$BASE/last-problem.log"
 
 # Checked before anything else, and after --help so that stays usable unprivileged.
 # Everything this script does needs the credentials in $BASE, which are root-only by
@@ -802,6 +831,21 @@ v = d.get(sys.argv[2])
 print("" if v is None else v)' "$1" "$2" 2>/dev/null
 }
 
+# The diagnosis the backup script wrote into last-run.json for a run that did not
+# end ok: why, the line that says it, and what to look at. Nothing for an ok run, or
+# for a record written before the diagnosis existed.
+show_diagnosis() {
+    [ -f "$LAST_RUN" ] || return 0
+    reason="$(jget "$LAST_RUN" reason)"
+    [ -n "$reason" ] && [ "$reason" != 'none' ] || return 0
+    cont "$reason, during $(jget "$LAST_RUN" phase)" "$C_ERR"
+    msg="$(jget "$LAST_RUN" message)"
+    [ -n "$msg" ] && printf '%s\n' "$msg" | fold -s -w 60 | while IFS= read -r l; do cont "$l" "$C_W"; done
+    hint="$(jget "$LAST_RUN" hint)"
+    [ -n "$hint" ] && printf '%s\n' "$hint" | fold -s -w 60 | while IFS= read -r l; do cont "$l" "$C_DIM"; done
+    [ "${1:-}" = 'nolink' ] || cont 'The whole run: sudo restic-ctl log --problem' "$C_DIM"
+}
+
 outcome_color() {
     case "$1" in
         ok)                     printf '%s' "$C_OK" ;;
@@ -860,6 +904,7 @@ $(fmt_bytes "$(jget "$PROGRESS" bytesDone)") of $(fmt_bytes "$(jget "$PROGRESS" 
             cont "snapshot ${sid:0:8}  -  $(jget "$LAST_RUN" filesNew) new / \
 $(jget "$LAST_RUN" filesChanged) changed files, $(fmt_bytes "$(jget "$LAST_RUN" dataAddedBytes)") added"
         fi
+        show_diagnosis
     fi
 
     if [ -f "$HISTORY" ] && [ "$HAVE_PY" = 1 ]; then
@@ -875,7 +920,8 @@ runs = runs[-30:]
 bad = [r for r in runs if r.get("outcome") not in ("ok", "warnings")]
 warn = [r for r in runs if r.get("outcome") == "warnings"]
 print("%d|%d|%d|%s" % (len(runs), len(bad), len(warn),
-      (bad[-1].get("finishedAt", "?") + " exit " + str(bad[-1].get("exitCode"))) if bad else ""))
+      (bad[-1].get("finishedAt", "?") + " exit " + str(bad[-1].get("exitCode"))
+       + (", " + bad[-1]["reason"] if bad[-1].get("reason") else "")) if bad else ""))
 ' "$HISTORY" 2>/dev/null)"
         if [ -n "$summary" ]; then
             total="${summary%%|*}"; rest="${summary#*|}"
@@ -1084,7 +1130,7 @@ tty = sys.stdout.isatty()
 print()
 print("  Run history - last %d of %d" % (min(n, len(runs)), len(runs)))
 print()
-print("  %-17s %-13s %-9s %-9s %-8s %s" % ("Finished", "Outcome", "Duration", "Added", "Snapshot", "Files new/chg"))
+print("  %-17s %-13s %-9s %-9s %-8s %-13s %s" % ("Finished", "Outcome", "Duration", "Added", "Snapshot", "Files new/chg", "Reason"))
 for r in runs[-n:]:
     oc = r.get("outcome", "?")
     col = COL.get(oc, "") if tty else ""
@@ -1092,8 +1138,10 @@ for r in runs[-n:]:
     fin = (r.get("finishedAt") or "?")[:16].replace("T", " ")
     sid = (r.get("snapshotId") or "-")[:8]
     fls = "-" if r.get("filesNew") is None else "%s / %s" % (r.get("filesNew"), r.get("filesChanged"))
-    print("  %-17s %s%-13s%s %-9s %-9s %-8s %s" % (
-        fin, col, oc, off, dur(r.get("durationSec")), human(r.get("dataAddedBytes")), sid, fls))
+    # Only for the runs that did not end ok; "-" for older records without one.
+    why = "" if oc == "ok" else (r.get("reason") or "-")
+    print("  %-17s %s%-13s%s %-9s %-9s %-8s %-13s %s" % (
+        fin, col, oc, off, dur(r.get("durationSec")), human(r.get("dataAddedBytes")), sid, fls, why))
 bad = [r for r in runs if r.get("outcome") not in ("ok", "warnings")]
 print()
 print("  Totals            %d runs, %d failed (%.0f%%)" % (
@@ -1179,6 +1227,7 @@ watch_run() {
                 cont "took $(fmt_dur "$(jget "$LAST_RUN" durationSec)"), exit code $(jget "$LAST_RUN" exitCode)"
                 sid="$(jget "$LAST_RUN" snapshotId)"
                 [ -n "$sid" ] && cont "snapshot ${sid:0:8}, $(fmt_bytes "$(jget "$LAST_RUN" dataAddedBytes)") added"
+                show_diagnosis
             else
                 field 'Finished' 'no record was written' "$C_WARN"
                 cont 'Check the log: restic-ctl log' "$C_DIM"
@@ -1205,6 +1254,29 @@ $(fmt_bytes "$(jget "$PROGRESS" totalBytes)")  ETA $(fmt_dur "$(jget "$PROGRESS"
 # ================================================================== log
 
 cmd_log() {
+    if [ -n "$LOG_WHICH" ]; then
+        if [ "$LOG_WHICH" = 'run' ]; then f="$RUN_LOG"; what='Last run'
+        else f="$PROBLEM_LOG"; what='Last run that did not end ok'; fi
+        if [ ! -f "$f" ]; then
+            printf '\n  %sNo %s yet.%s\n' "$C_WARN" "$f" "$C_OFF"
+            if [ "$LOG_WHICH" = 'problem' ]; then
+                printf '  %sNo run has ended other than ok since it was introduced.%s\n\n' "$C_DIM" "$C_OFF"
+            else
+                printf '  %sIt is written at the end of every backup, from this version on.%s\n\n' "$C_DIM" "$C_OFF"
+            fi
+            return
+        fi
+        head_ "$what - $f"
+        # The diagnosis on top, when the file is the one last-run.json describes: the
+        # problem log can be older than the last run.
+        if [ "$LOG_WHICH" = 'run' ] || [ "$(jget "$LAST_RUN" outcome)" != 'ok' ]; then
+            show_diagnosis nolink
+        fi
+        printf '\n'
+        cat "$f"
+        printf '\n'
+        return
+    fi
     if [ ! -f "$LOG" ]; then
         printf '\n  %sNo log yet (%s).%s\n\n' "$C_WARN" "$LOG" "$C_OFF"
         return
@@ -1215,7 +1287,9 @@ cmd_log() {
         tail -n "$COUNT" -f "$LOG"
     else
         tail -n "$COUNT" "$LOG"
-        printf '\n  %s--follow keeps watching. journalctl -u %s for the service side.%s\n\n' \
+        printf '\n  %s--run: the last run whole, --problem: the last that did not end ok.%s\n' \
+            "$C_DIM" "$C_OFF"
+        printf '  %s--follow keeps watching. journalctl -u %s for the service side.%s\n\n' \
             "$C_DIM" "$SERVICE" "$C_OFF"
     fi
 }

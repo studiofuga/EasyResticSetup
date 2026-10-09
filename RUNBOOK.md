@@ -132,8 +132,24 @@ So each backup run records its own outcome locally:
 | File | Contents |
 |------|----------|
 | `progress.json` | while running: percent, files, bytes, ETA. Deleted at the end. |
-| `last-run.json` | the latest run: outcome, exit code, duration, snapshot id, bytes added |
-| `history.jsonl` | one line per run, last 500, **including failed ones** |
+| `last-run.json` | the latest run: outcome, exit code, duration, snapshot id, bytes added; for a run that did not end `ok`, the diagnosis: phase, reason, message, hint, log tail |
+| `history.jsonl` | one line per run, last 500, **including failed ones**, with their reason |
+| `last-run.log` | the latest run's own part of the log, whole |
+| `last-problem.log` | the same, for the latest run that did not end `ok`; survives later good runs |
+
+### When a backup fails
+
+Start with `restic-ctl status`: under *Last completed run* it shows the reason (one
+word: `nas-unreachable`, `ssh-auth`, `repo-locked`...), the log line that says it and
+a hint. Home Assistant shows the same on the device, and in the notification. For
+the whole run, `restic-ctl log --problem` (`-Problem` on Windows), or from any
+machine `mosquitto_sub -C 1 -t restic/<box>/log`. The list of reasons is in
+`HOME-ASSISTANT.md` under *Diagnosis*.
+
+A record whose reason is `-` in `history` predates the diagnosis. Before it, the
+backup's fatal error was lost altogether: since restic 0.17, `backup --json` reports
+it as a JSON `exit_error` message instead of text, and the log filter dropped it,
+leaving only `backup FAILED (exit N)`.
 
 `progress.json` also solves a problem that has no other solution on either
 platform: restic draws its progress bar only on a terminal, so a scheduled run
@@ -894,6 +910,29 @@ Written and syntax-checked, but not yet exercised against the real NAS:
   `restic-ctl verify` waiting on them. The first real backup after `--update` /
   `-Update` is the test: `restic-ctl status` should then show a sample result, and
   `restic-ctl verify` a data check
+- **Failure diagnosis** (2026-10-09). Tested against restic 0.18.1 on Linux, and the
+  Windows script under PowerShell 7 on Linux, with a fake `ssh` printing the real
+  messages: name not resolved, connection timed out, key refused and host key
+  refused were classified from ssh's own line, not from restic's generic "server
+  unexpectedly closed connection"; missing repository (exit 10), wrong password
+  (exit 12), unreadable files (exit 3), a lock during forget/prune (`prune-failed`,
+  history line corrected rather than duplicated), a stop signal mid-backup on Linux
+  (`interrupted`) and an error in the script itself (`script-error`, on both). The
+  log topic, its cut at 256 KiB, `unpublish` clearing it, and identical discovery
+  from both platforms were checked against a test broker; the dashboard card and the
+  notification text with Home Assistant's functions stubbed. **Not yet seen:** a
+  real NAS failure on either platform (the patterns come from OpenSSH's messages,
+  which the Windows port shares, plus "No such host is known" for Windows' resolver),
+  Windows PowerShell 5.1 itself, and the card inside Home Assistant
+- **Sample check and symlinks** (2026-10-09). A real false alarm: the sample picked a
+  symlink to a file (a Flatpak runtime library), `restic dump` refused it ("should be
+  a file, but is a symlink"), and that was taken for damage and froze the prune. Now
+  only regular files are picked (`lstat` on Linux, no reparse point on Windows), a
+  "not a regular file" refusal is skipped, and a dump or a data check that could not
+  run - lock, network, a stop signal - is an `error`, which does not freeze. Tested
+  on both platforms with symlinks in the snapshot and with a symlink replaced by a
+  file afterwards. A prune frozen by the old behaviour stays frozen until
+  `restic-ctl unfreeze`
 - no **restore** has been verified on any machine. This is the real gap, not a detail:
   a backup that has never been restored from is a hypothesis. `restic-ctl help restore`
   lists three ways to test one without needing free disk space

@@ -71,7 +71,10 @@ script and the NAS provisioning script. Everything you want to change is in
 Under the configuration directory, on both: `config.json`, `password`,
 `excludes.txt`, `ssh/config`, `ssh/id_ed25519`, `ssh/known_hosts`, `progress.json`,
 `last-run.json`, `history.jsonl`, `verify-state.json`, `manifest/`, `cache/`, and
-`prune-frozen.json` while a check has found damage.
+`prune-frozen.json` while a check has found damage. Next to the log (`logs\` on
+Windows, the configuration directory on Linux): `last-run.log`, the last backup's own
+part of the log, and `last-problem.log`, the same for the last run that did not end
+`ok`.
 
 ## How to read the two spellings
 
@@ -96,6 +99,8 @@ also run `.\restic-ctl.ps1` or `./restic-ctl.sh` directly.
 | What is in the repository? | `restic-ctl snapshots` | `sudo restic-ctl snapshots` |
 | Back up now, properly | `restic-ctl run` | `sudo restic-ctl run` |
 | Did anything fail lately? | `restic-ctl history` | `sudo restic-ctl history` |
+| Why did the last one fail? | `restic-ctl status` | `sudo restic-ctl status` |
+| The whole log of that run | `restic-ctl log -Problem` | `sudo restic-ctl log --problem` |
 | Is the repository sound? | `restic-ctl check` | `sudo restic-ctl check` |
 | Is the data itself sound? | `restic-ctl check -Data` | `sudo restic-ctl check --data` |
 | When does it run? | `restic-ctl schedule` | `sudo restic-ctl schedule` |
@@ -168,9 +173,9 @@ What it reports:
 |---|---|
 | **State** | `idle`, or `running` — and where that came from: the scheduler, a bare `restic` process, or only a progress file that is still fresh (shown as `maybe`) |
 | **Progress** | while running: files and bytes done, from `progress.json`. The backup script writes it from `restic --json`, which is the only way to see progress from a scheduled run — it has no terminal and so no progress bar |
-| **Last run** | result, when, how long, what changed |
+| **Last run** | result, when, how long, what changed; for a run that did not end `ok`, the diagnosis: the reason, the log line that says it, and a hint (see *Diagnosis* in `HOME-ASSISTANT.md` for the list) |
 | **Scheduler** | the task's or timer's state, last result, next run |
-| **Recent failures** | counted from `history.jsonl`. This matters: a failed backup leaves **no trace in the repository**, so `restic snapshots` looks entirely normal after one |
+| **Recent failures** | counted from `history.jsonl`, with the reason of the latest. This matters: a failed backup leaves **no trace in the repository**, so `restic snapshots` looks entirely normal after one |
 | **Credentials** | Windows: that the SSH key is owned by `SYSTEM`/`Administrators` and that nobody else is granted access — the two independent causes of `UNPROTECTED PRIVATE KEY FILE`. Linux: root-owned and `600` |
 
 `-Deep` / `--deep` adds a structural `restic check`. That contacts the NAS and takes a
@@ -309,7 +314,8 @@ sudo restic-ctl history [--count <n>]
 
 A table of recent runs from `history.jsonl`, appended by the backup script at the end of
 every run: start, duration, result, new and changed files, bytes added, snapshot id when
-there is one.
+there is one, and the reason for each run that did not end `ok` (`-` for runs recorded
+before the diagnosis existed).
 
 This file exists because **the repository holds no record of a failed backup**. If the
 run died there is no snapshot, and nothing in restic's own output will tell you it ever
@@ -319,10 +325,18 @@ tried.
 
 ```
 restic-ctl log [-Count <n>] [-Follow]
+restic-ctl log -Run | -Problem
 sudo restic-ctl log [--count <n>] [--follow]
+sudo restic-ctl log --run | --problem
 ```
 
 The tail of the backup log. `-Follow` / `--follow` keeps watching.
+
+`-Run` / `--run` prints `last-run.log`, the last backup's own part of the log, whole,
+with the diagnosis on top. `-Problem` / `--problem` prints `last-problem.log`, the
+same for the last run that did not end `ok`; it is kept until the next such run, so a
+good run afterwards does not take the evidence away. Both are written at the end of
+every backup, after the prune, so they hold the whole run.
 
 For a backup in progress, `status` is usually the better view: the log records what
 happened at each stage, `progress.json` carries the live counters. On Linux,
@@ -352,21 +366,24 @@ restic-ctl publish [--dry-run]          (-DryRun works too)
 sudo restic-ctl publish [--dry-run]
 ```
 
-Sends this machine's backup state to Home Assistant now: the same two messages the
+Sends this machine's backup state to Home Assistant now: the same three messages the
 backup sends at the end of every run, QoS 1, retained, to the broker in the
 `homeAssistant` section of `config.json`:
 
 - `homeassistant/device/restic/<id>/config`, MQTT discovery: Home Assistant creates the
   device and its entities from it, so nothing is configured there for each machine;
-- `restic/<box>`, the state: `last-run.json` plus `box` and `publishedAt`.
+- `restic/<box>`, the state: `last-run.json` plus `box` and `publishedAt`, with the
+  diagnosis when the run did not end `ok`;
+- `restic/<box>/log`, `last-run.log` as plain text, for any MQTT client. No entity
+  reads it. Not sent until a backup has written it.
 
 Use it to check the broker settings without waiting for a backup, or to put a
 machine back after its retained messages were cleared. What the entities are, and
 the broker ACL they need, is in `HOME-ASSISTANT.md`.
 
 `--dry-run` prints what would be sent and sends nothing: broker, login (only whether a
-password is stored, never the password), client id, both topics with their sizes, and
-both payloads. It does not contact the broker, writes nothing to the log, and also
+password is stored, never the password), client id, the three topics with their sizes,
+and the discovery and state payloads (the log's size only). It does not contact the broker, writes nothing to the log, and also
 works before a broker is configured.
 
 ```
@@ -378,6 +395,7 @@ works before a broker is configured.
   Delivery          QoS 1, retained
   Discovery         homeassistant/device/restic/restic-<machine>/config, 1681 bytes
   Topic             restic/restic-<machine>, 358 bytes
+  Log               restic/restic-<machine>/log, 2190 bytes, from /etc/restic/last-run.log
 
     Discovery payload:
     {
@@ -411,9 +429,10 @@ restic-ctl unpublish [--dry-run]        (-DryRun works too)
 sudo restic-ctl unpublish [--dry-run]
 ```
 
-Removes this machine from Home Assistant: an empty retained message on each of the two
+Removes this machine from Home Assistant: an empty retained message on each of the three
 topics `publish` uses. Home Assistant deletes the device and its entities, and the
-broker forgets the last state. `--dry-run` prints the two topics and sends nothing.
+broker forgets the last state and log. `--dry-run` prints the three topics and sends
+nothing.
 
 The next backup announces the machine again, so to retire one, stop its schedule first:
 
@@ -693,10 +712,10 @@ is already set up is a single step:
 sudo ./setup-restic-backup.sh --only 3 --ha-host <broker> --ha-user <mqtt-user>
 ```
 
-Two messages go out: the discovery message on `homeassistant/device/restic/<id>/config`, then
-the state on the topic above, which is the content of `last-run.json` plus `box` and
-`publishedAt`. On a machine that has never run a backup, `outcome` is `never`. Both are
-sent after every real run — success, failure, or failed prune — and never after a dry
+Three messages go out: the discovery message on `homeassistant/device/restic/<id>/config`,
+then the state on the topic above, which is the content of `last-run.json` plus `box` and
+`publishedAt`, then the run's log on the same topic plus `/log`. On a machine that has
+never run a backup, `outcome` is `never`. All are sent after every real run — success, failure, or failed prune — and never after a dry
 run. A broker that is down or
 refuses the login is logged (`ha: publish FAILED: …`) and changes nothing about the
 backup's own result or exit code.
@@ -807,15 +826,16 @@ restic-backup.sh --help
 restic-verify timer or task runs. Both write `verify-state.json`, publish to Home
 Assistant, and exit 0 ok or skipped, 1 damage found, 2 the check could not run.
 
-`-Publish` / `--publish` sends the discovery and state messages; `-Unpublish` /
-`--unpublish` empties both. Each exits 0 when the broker confirmed the messages, 1 when
+`-Publish` / `--publish` sends the discovery, state and log messages; `-Unpublish` /
+`--unpublish` empties all three. Each exits 0 when the broker confirmed the messages, 1 when
 it did not (the reason is printed and logged), 2 when Home Assistant is not configured.
 With `-DryRun` / `--dry-run` after it, it prints the messages instead and always exits 0
 unless they cannot be built. `restic-ctl publish` and `restic-ctl unpublish` are the
 friendlier way in.
 
 It reads everything from `config.json` and writes the log, `progress.json`,
-`last-run.json` and `history.jsonl`. On Windows it uses `--use-fs-snapshot` (VSS), which
+`last-run.json`, `history.jsonl`, `last-run.log` and, after a run that did not end
+`ok`, `last-problem.log`. On Windows it uses `--use-fs-snapshot` (VSS), which
 is why it needs to run elevated. On both it asks the OS not to sleep while it works —
 Windows through the Power Request API, Linux through `systemd-inhibit --what=idle`.
 
@@ -825,9 +845,18 @@ Besides `excludes.txt`, a run leaves out every folder that contains a file named
 
 A normal run, in order: clear stale locks; write the package manifest (`manifest/`,
 added to the backup paths when they do not already cover it); back up; record the
-outcome; read back a sample of the new snapshot; then forget/prune - unless
-`prune-frozen.json` exists, in which case the prune is skipped and logged; finally
-publish to Home Assistant.
+outcome, with a diagnosis if it did not end `ok`; read back a sample of the new
+snapshot; then forget/prune - unless `prune-frozen.json` exists, in which case the
+prune is skipped and logged; finally cut this run's part of the log out into
+`last-run.log` and publish to Home Assistant.
+
+Whatever ends the run, it leaves a record and a report. A stop signal (shutdown,
+suspend, `systemctl stop`, Ctrl+C) is recorded as `interrupted`, and nothing new is
+started after it. On Linux an unexpected exit of the script itself (`set -u`, a
+failed command) is caught on `EXIT` and recorded as `script-error`; on Windows the
+same is done for an exception, which is written to the log with its line number.
+Only a killed process gets past this - Task Scheduler's time limit, `SIGKILL` - and
+that one Home Assistant's staleness check catches.
 
 **Edits here are overwritten by the next update.** Change `config.json`, or the installer
 that generates this file.

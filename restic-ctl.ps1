@@ -91,6 +91,8 @@ param(
     [string] $Subset = '1/12',
     [int]    $Count  = 15,   # history/log: how many entries
     [switch] $Follow,        # log: keep watching
+    [switch] $Run,           # log: the last run's own log, whole
+    [switch] $Problem,       # log: the last run that did not end ok, whole
     [switch] $NoWait,        # run: start and return instead of following
     [switch] $Yes,           # forget: skip the confirmation prompt
     [string] $Target,        # restore: where to restore to
@@ -117,7 +119,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$CtlVersion = '2026.10.02.2'
+$CtlVersion = '2026.10.09.2'
 
 # Which parameters were actually typed. "schedule -TimeLimitHours 0" has to be told
 # apart from "schedule" with the default still sitting there.
@@ -148,7 +150,8 @@ READING  (fast - local files and repository metadata, no data transfer)
   snapshots           what the repository holds: the list, the age of the newest,
                       totals
   history             table of recent runs, the failed ones included
-  log                 the tail of the backup log
+  log                 the tail of the backup log; -Run: the whole last run,
+                      -Problem: the last run that did not end ok
   config              this machine's effective settings and where they live
   schedule            when the backup runs, stored intent vs registered task
 
@@ -187,6 +190,7 @@ COMMON OPTIONS
   -Data [-Subset f]   check: re-read actual data blobs, default 1/12 of them
   -Count <n>          history, log: how many entries (default 15)
   -Follow             log: keep watching
+  -Run, -Problem      log: the last run's own log, or the last problem run's
   -NoWait             run: start the task and return instead of following it
   -Yes                forget: skip the confirmation prompt
   -Target <dir>       restore: where to restore to (required)
@@ -332,10 +336,23 @@ bytes added, and the snapshot id when there is one.
 $HelpTopics['log'] = @'
 restic-ctl log - the backup log.
 
-  restic-ctl log [-Count <n>] [-Follow]
+  restic-ctl log [-Count <n>] [-Follow]   the tail of the whole log
+  restic-ctl log -Run                     the last backup run, all of it
+  restic-ctl log -Problem                 the last run that did not end ok
 
-The tail of C:\ProgramData\restic\logs\restic-backup.log, written by the backup
-script on every run. -Follow keeps watching, for a backup in progress.
+The log, C:\ProgramData\restic\logs\restic-backup.log, is written by the backup
+script on every run, checks included. -Follow keeps watching, for a backup in
+progress.
+
+At the end of every backup the script also keeps that run's own part of it, in
+the same logs folder:
+  last-run.log       the last run, whatever its outcome
+  last-problem.log   the last run that did not end ok - failed, warnings,
+                     prune-failed - kept until the next such run, so a good run
+                     afterwards does not take the evidence away
+-Run and -Problem print those, whole, with the diagnosis on top. The same
+diagnosis is in "status" and in Home Assistant; last-run.log is also on the
+broker, retained, on restic/<box>/log.
 
 For a running backup, "status" is usually the better view: the log records what
 happened at each stage, while progress.json carries the live counters.
@@ -443,15 +460,19 @@ restic-ctl publish - send this machine's backup state to Home Assistant.
   restic-ctl publish --dry-run   print the topics and the payloads, send nothing
                                  (-DryRun works too)
 
-The same two messages the backup sends at the end of every run, over MQTT with QoS 1
-and the retain flag, to the broker in the homeAssistant section of config.json:
+The same three messages the backup sends at the end of every run, over MQTT with
+QoS 1 and the retain flag, to the broker in the homeAssistant section of config.json:
 
   homeassistant/device/restic/<id>/config
         MQTT discovery. Home Assistant creates the device and its entities from
         it, so nothing is configured on the HA side for each machine.
   restic/<box>
         the state: last-run.json plus "box" and "publishedAt". A machine that has
-        never run a backup sends outcome "never".
+        never run a backup sends outcome "never". After a run that did not end ok
+        it carries the diagnosis: phase, reason, message, hint, logTail.
+  restic/<box>/log
+        last-run.log, the last run's own log, as plain text. No entity reads it;
+        read it with any MQTT client. Not sent until a backup has written it.
 
 Use it to check the broker settings without waiting for a backup, or to put a
 machine's state back after the retained message was cleared on the broker.
@@ -548,11 +569,11 @@ $HelpTopics['unpublish'] = @'
 restic-ctl unpublish - remove this machine from Home Assistant.
 
   restic-ctl unpublish             remove it now
-  restic-ctl unpublish --dry-run   print the two topics it would clear
+  restic-ctl unpublish --dry-run   print the three topics it would clear
                                    (-DryRun works too)
 
-Sends an empty retained message to both topics publish uses. Home Assistant removes
-the device and its entities, and the broker forgets the last state.
+Sends an empty retained message to the three topics publish uses. Home Assistant
+removes the device and its entities, and the broker forgets the last state and log.
 
 The next backup announces the machine again. To retire it, stop the scheduled task
 first, then unpublish (from an elevated prompt):
@@ -726,6 +747,8 @@ $LogFile      = Join-Path $Base 'logs\restic-backup.log'
 $ProgressFile = Join-Path $Base 'progress.json'
 $LastRunFile  = Join-Path $Base 'last-run.json'
 $HistoryFile  = Join-Path $Base 'history.jsonl'
+$RunLogFile     = Join-Path $Base 'logs\last-run.log'
+$ProblemLogFile = Join-Path $Base 'logs\last-problem.log'
 $PasswordFile = Join-Path $Base 'password'
 
 $env:RESTIC_REPOSITORY    = $Settings.Repository
@@ -834,6 +857,29 @@ function Get-OutcomeColor([string]$Outcome) {
     }
 }
 
+# Lines of at most $Width characters, broken at spaces.
+function Split-Text([string]$Text, [int]$Width = 60) {
+    $lines = @(); $cur = ''
+    foreach ($w in ($Text -split ' ')) {
+        if ($cur -and ($cur.Length + 1 + $w.Length) -gt $Width) { $lines += $cur; $cur = $w }
+        elseif ($cur) { $cur += ' ' + $w }
+        else { $cur = $w }
+    }
+    if ($cur) { $lines += $cur }
+    return $lines
+}
+
+# The diagnosis the backup script wrote into last-run.json for a run that did not end
+# ok: why, the line that says it, and what to look at. Nothing for an ok run, or for a
+# record written before the diagnosis existed.
+function Show-Diagnosis($Last, [switch]$NoLink) {
+    if (-not $Last -or -not $Last.reason -or $Last.reason -eq 'none') { return }
+    Write-Cont "$($Last.reason), during $($Last.phase)" 'Red'
+    if ($Last.message) { foreach ($l in (Split-Text "$($Last.message)")) { Write-Cont $l 'White' } }
+    if ($Last.hint) { foreach ($l in (Split-Text "$($Last.hint)")) { Write-Cont $l 'DarkGray' } }
+    if (-not $NoLink) { Write-Cont 'The whole run: restic-ctl log -Problem' 'DarkGray' }
+}
+
 # =============================================================== status
 
 function Show-Status {
@@ -893,6 +939,7 @@ function Show-Status {
                 $last.snapshotId.Substring(0, [math]::Min(8, $last.snapshotId.Length)),
                 $last.filesNew, $last.filesChanged, (Format-Bytes $last.dataAddedBytes))
         }
+        Show-Diagnosis $last
     }
 
     # --- recent outcomes
@@ -906,7 +953,8 @@ function Show-Status {
             $recent.Count, $bad.Count, $warn.Count) $color
         if ($bad.Count -gt 0) {
             $lastBad = $bad[-1]
-            Write-Cont ("last failure {0} (exit {1})" -f $lastBad.finishedAt, $lastBad.exitCode) 'Red'
+            $why = if ($lastBad.reason) { ", $($lastBad.reason)" } else { '' }
+            Write-Cont ("last failure {0} (exit {1}{2})" -f $lastBad.finishedAt, $lastBad.exitCode, $why) 'Red'
             Write-Cont "restic-ctl.ps1 history   for the full table" 'DarkGray'
         }
     }
@@ -1171,8 +1219,8 @@ function Show-History {
 
     Write-Head ("Run history - last {0} of {1}" -f ([math]::Min($Count, $hist.Count)), $hist.Count)
     Write-Host ''
-    Write-Host ("  {0,-17} {1,-13} {2,-9} {3,-9} {4,-8} {5}" -f `
-        'Finished', 'Outcome', 'Duration', 'Added', 'Snapshot', 'Files new/chg') -ForegroundColor DarkGray
+    Write-Host ("  {0,-17} {1,-13} {2,-9} {3,-9} {4,-8} {5,-13} {6}" -f `
+        'Finished', 'Outcome', 'Duration', 'Added', 'Snapshot', 'Files new/chg', 'Reason') -ForegroundColor DarkGray
 
     foreach ($h in @($hist | Select-Object -Last $Count)) {
         $when = try { ([datetime]$h.finishedAt).ToString('yyyy-MM-dd HH:mm') } catch { "$($h.finishedAt)" }
@@ -1181,7 +1229,9 @@ function Show-History {
         $fls  = if ($null -ne $h.filesNew) { "$($h.filesNew) / $($h.filesChanged)" } else { '-' }
         Write-Host ("  {0,-17} " -f $when) -NoNewline
         Write-Host ("{0,-13} " -f $h.outcome) -NoNewline -ForegroundColor (Get-OutcomeColor $h.outcome)
-        Write-Host ("{0,-9} {1,-9} {2,-8} {3}" -f (Format-Duration $h.durationSec), $add, $snap, $fls)
+        # Only for the runs that did not end ok; "-" for older records without one.
+        $why  = if ($h.outcome -eq 'ok') { '' } elseif ($h.reason) { $h.reason } else { '-' }
+        Write-Host ("{0,-9} {1,-9} {2,-8} {3,-13} {4}" -f (Format-Duration $h.durationSec), $add, $snap, $fls, $why)
     }
 
     $bad = @($hist | Where-Object { $_.outcome -notin @('ok', 'warnings') })
@@ -1292,6 +1342,7 @@ function Watch-Run {
                         $last.snapshotId.Substring(0, [math]::Min(8, $last.snapshotId.Length)),
                         (Format-Bytes $last.dataAddedBytes))
                 }
+                Show-Diagnosis $last
             } else {
                 Write-Field 'Finished' 'restic is no longer running, no record was written' 'Yellow'
                 Write-Cont 'Check the log: restic-ctl.ps1 log' 'DarkGray'
@@ -1321,6 +1372,31 @@ function Watch-Run {
 # ================================================================== log
 
 function Show-Log {
+    if ($Run -or $Problem -or ($Rest -contains '--run') -or ($Rest -contains '--problem')) {
+        $useProblem = $Problem -or ($Rest -contains '--problem')
+        if ($useProblem) { $f = $ProblemLogFile; $what = 'Last run that did not end ok' }
+        else { $f = $RunLogFile; $what = 'Last run' }
+        if (-not (Test-Path $f)) {
+            Write-Host ''
+            Write-Host "  No $f yet." -ForegroundColor Yellow
+            if ($useProblem) {
+                Write-Host '  No run has ended other than ok since it was introduced.' -ForegroundColor DarkGray
+            } else {
+                Write-Host '  It is written at the end of every backup, from this version on.' -ForegroundColor DarkGray
+            }
+            Write-Host ''
+            return
+        }
+        Write-Head "$what - $f"
+        # The diagnosis on top, when the file is the one last-run.json describes: the
+        # problem log can be older than the last run.
+        $last = Read-Json $LastRunFile
+        if ($last -and (-not $useProblem -or $last.outcome -ne 'ok')) { Show-Diagnosis $last -NoLink }
+        Write-Host ''
+        Get-Content $f
+        Write-Host ''
+        return
+    }
     if (-not (Test-Path $LogFile)) {
         Write-Host ''
         Write-Host "  No log yet ($LogFile)." -ForegroundColor Yellow
@@ -1334,6 +1410,7 @@ function Show-Log {
     } else {
         Get-Content $LogFile -Tail $Count
         Write-Host ''
+        Write-Host '  -Run: the last run whole, -Problem: the last that did not end ok.' -ForegroundColor DarkGray
         Write-Host '  -Follow keeps watching.' -ForegroundColor DarkGray
         Write-Host ''
     }

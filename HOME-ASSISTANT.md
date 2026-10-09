@@ -11,13 +11,22 @@ lines on the Home Assistant side that cover the whole fleet.
 ## What each machine sends
 
 After every real backup (success, failure or failed prune, never after a dry run),
-and on `restic-ctl publish`, each machine sends two messages, both QoS 1 and
+and on `restic-ctl publish`, each machine sends three messages, all QoS 1 and
 **retained**, so Home Assistant has them again after it restarts:
 
 | Topic | Content |
 |---|---|
 | `homeassistant/device/restic/<id>/config` | MQTT discovery: the device and its entities |
 | `restic/<box>` | the state: `last-run.json` plus `box`, `verify` and `publishedAt` |
+| `restic/<box>/log` | the last run's whole log, `last-run.log`, as plain text |
+
+After a check (the sample read-back or the daily data check) only the first two are
+sent: a check does not change the run's log.
+
+The log topic has no entity and Home Assistant never subscribes to it, so it stays
+out of HA's database however long it is. It is there to be read from any machine
+with an MQTT client (see *Why it failed* below). It is capped at the last 256 KiB of
+the run; the whole run is in `last-run.log` on the machine.
 
 Discovery goes first, so Home Assistant is already subscribed to the state topic
 when the state arrives. The `restic` level in the discovery topic is the optional
@@ -45,7 +54,9 @@ each machine its own box.
 
 | Entity | Type | From | Notes |
 |---|---|---|---|
-| Outcome | sensor, enum | `outcome` | `ok`, `warnings`, `failed`, `prune-failed`, `never`. The whole state message is also its attributes: snapshot id, file counts, host, exit code |
+| Outcome | sensor, enum | `outcome` | `ok`, `warnings`, `failed`, `prune-failed`, `never`. The whole state message is also its attributes: snapshot id, file counts, host, exit code, and the diagnosis below |
+| Reason | sensor, enum | `reason` | why the last run did not end `ok`, from a fixed list (see *Diagnosis*); `none` for `ok` and `never`, `unknown` for a failure recorded by an older version |
+| Diagnosis | sensor | `message` | the log line that says what went wrong, cut at 250 characters; reads the outcome itself (`ok`, `never`) when there is nothing to say |
 | Last run | sensor, timestamp | `finishedAt` | the end of the last run, successful or not |
 | Duration | sensor, seconds | `durationSec` | |
 | Data added | sensor, bytes | `dataAddedBytes` | what the last snapshot added to the repository |
@@ -65,6 +76,47 @@ backup and a check never overwrite each other's results.
 A machine that has never backed up sends only `outcome: never`: the other sensors
 read *unknown* until its first run.
 
+### Diagnosis
+
+A run that does not end `ok` carries five more fields in its state, written by the
+backup script from that run's own part of the log:
+
+| Field | |
+|---|---|
+| `phase` | where it stopped: `backup`, `prune`, or `script` (the script itself failed) |
+| `reason` | what kind of problem, one word from the list below |
+| `message` | the line of the log that says it, at most 300 characters |
+| `hint` | what to look at first |
+| `logTail` | the last 25 lines of the run's log, at most 3000 characters |
+
+| Reason | Meaning |
+|---|---|
+| `unreadable-files` | the snapshot was saved, but some files could not be read (outcome `warnings`) |
+| `nas-unreachable` | name not resolved, timeout, no route, refused: Tailscale or the NAS is down |
+| `ssh-auth` | the NAS refused this machine's key |
+| `ssh-hostkey` | the NAS's host key is unknown or has changed |
+| `sftp-unavailable` | SSH works, SFTP is off on the NAS |
+| `nas-permission` | logged in, but cannot write in the repository |
+| `nas-full` | no space left, or quota exceeded |
+| `repo-missing` | no repository at `nas.repoPath` |
+| `wrong-password` | the password file does not open the repository |
+| `repo-locked` | another restic process holds the lock |
+| `repo-damaged` | restic reported damaged data: do not prune |
+| `connection-lost` | the connection dropped during the run |
+| `interrupted` | stopped by a shutdown, a suspend, `systemctl stop`, Ctrl+C |
+| `killed` | restic was killed outright (out of memory, a stop that timed out) |
+| `script-error` | the backup script itself stopped before recording a result |
+| `unknown` | none of the above: `message` is the last error in the log |
+
+The specific cause wins over the consequence: an unreachable NAS shows up first as
+ssh's own "Could not resolve hostname", then as restic's "server unexpectedly
+closed connection"; the reason is `nas-unreachable`, not `connection-lost`. The
+rules are the same on Linux and Windows, only the hints differ where the commands do.
+
+The same diagnosis is shown by `restic-ctl status`, by `restic-ctl log --run` /
+`--problem` on top of the log, and its reason is the last column of
+`restic-ctl history`.
+
 To see exactly what a machine sends without sending it:
 
 ```
@@ -74,7 +126,7 @@ sudo restic-ctl publish --dry-run
 
 ## The broker
 
-**If the broker has an ACL, every machine must be able to write both of its
+**If the broker has an ACL, every machine must be able to write all three of its
 topics.** Mosquitto accepts a publish to a denied topic and silently drops it: the
 client sees a normal acknowledgement, `restic-ctl publish` reports success, and the
 device just never shows up in Home Assistant. The add-on's log says
@@ -108,8 +160,13 @@ Each machine can write only its own topics:
 ```
 user restic-laptop
 topic write restic/laptop
+topic write restic/laptop/log
 topic write homeassistant/device/restic/restic-laptop/config
 ```
+
+A machine updated from a version without the log topic needs the `restic/<box>/log`
+line added: without it the broker drops the log silently, as above, and only the log
+is missing - the state and the diagnosis still arrive.
 
 The discovery half can be one line for the whole fleet, since the discovery id is the
 client id:
@@ -171,72 +228,11 @@ machines lives in one.
    `configuration.yaml`, with the File editor or Studio Code Server add-on, or over
    the Samba share.
 
-2. **Create `packages/restic.yaml`** with this content:
-
-   ```yaml
-   template:
-     - sensor:
-         - name: "Restic attention"
-           unique_id: restic_attention
-           icon: mdi:backup-restore
-           # How many problems need a look; the list is in the "machines" attribute. The
-           # same loop as below, counted: a template sensor's state cannot read its own
-           # attributes.
-           state: >
-             {% set ns = namespace(l=[]) %}
-             {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
-               {% set t = states(e) | as_datetime(none) %}
-               {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
-               {% set vp = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_verification_problem') %}
-               {% set dc = states(e | replace('_last_run', '_last_data_check')) | as_datetime(none) %}
-               {% if t is none or now() - t > timedelta(hours=36) or is_state(p, 'on') %}
-                 {% set ns.l = ns.l + [e] %}
-               {% endif %}
-               {% if is_state(vp, 'on') %}{% set ns.l = ns.l + [vp] %}{% endif %}
-               {% if dc is not none and now() - dc > timedelta(hours=72) %}{% set ns.l = ns.l + [e] %}{% endif %}
-             {% endfor %}
-             {{ ns.l | count }}
-           attributes:
-             machines: >
-               {% set ns = namespace(l=[]) %}
-               {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
-                 {% set n = device_attr(e, 'name') %}
-                 {% set t = states(e) | as_datetime(none) %}
-                 {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
-                 {% set o = states(e | replace('_last_run', '_outcome')) %}
-                 {% set vp = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_verification_problem') %}
-                 {% set v = states(e | replace('_last_run', '_verification')) %}
-                 {% set dc = states(e | replace('_last_run', '_last_data_check')) | as_datetime(none) %}
-                 {% if t is none or now() - t > timedelta(hours=36) %}
-                   {% set ns.l = ns.l + [n ~ ': no run in 36 h (' ~ o ~ ')'] %}
-                 {% elif is_state(p, 'on') %}
-                   {% set ns.l = ns.l + [n ~ ': ' ~ o] %}
-                 {% endif %}
-                 {% if is_state(vp, 'on') %}
-                   {% set ns.l = ns.l + [n ~ ': verification ' ~ v] %}
-                 {% endif %}
-                 {% if dc is not none and now() - dc > timedelta(hours=72) %}
-                   {% set ns.l = ns.l + [n ~ ': no data check in 72 h'] %}
-                 {% endif %}
-               {% endfor %}
-               {{ ns.l }}
-
-   automation:
-     - id: restic_attention_notify
-       alias: "Restic: a machine needs attention"
-       triggers:
-         - trigger: state
-           entity_id: sensor.restic_attention
-       conditions:
-         - condition: template
-           value_template: >
-             {{ trigger.to_state.state | int(0) > trigger.from_state.state | int(0) }}
-       actions:
-         - action: notify.notify
-           data:
-             title: "Backups"
-             message: "{{ state_attr('sensor.restic_attention', 'machines') | join('\n') }}"
-   ```
+2. **Copy `home-assistant/restic.yaml`** from this repository to `packages/restic.yaml`
+   in the Home Assistant configuration folder. It holds the *Restic attention* sensor -
+   the count, with the list of machines and what is wrong with each in its `machines`
+   attribute, the reason and log line included when the machine sends one - and the
+   automation that notifies when the count goes up.
 
 3. **Point the notification at a real target.** `notify.notify` exists only on some
    setups. The usual one is the companion app, `notify.mobile_app_<phone>`: find the
@@ -282,10 +278,37 @@ Both the sensor and the automation rely on the entity ids Home Assistant generat
 `sensor.restic_<name>_last_run` and so on. Renaming a device in the UI does not change
 them, but renaming its entity ids does, and a renamed machine then drops out of both.
 
+## Why it failed
+
+Three places, from quickest to fullest.
+
+**The notification and the device page.** The notification of the package above
+carries the reason and the message: `Restic laptop: failed - nas-unreachable: ssh:
+Could not resolve hostname ...`. On the device page, *Reason* and *Diagnosis* say
+the same; the *Outcome* entity's attributes add `hint` and `logTail`.
+
+**A dashboard card** that shows every machine needing attention, with the reason,
+the log line, the hint and the last lines of its log: `home-assistant/restic-card.yaml`.
+Dashboard > Edit > Add card > Manual, and paste it. It finds the machines by their
+entity ids, like the package, so a new machine appears without editing it.
+
+**The whole log of the last run**, from any machine with the Mosquitto clients:
+
+```
+mosquitto_sub -h <broker> -u <user> -P <password> -C 1 -t 'restic/laptop/log'
+mosquitto_sub -h <broker> -u <user> -P <password> -v -t 'restic/+/log'
+```
+
+The first prints one machine's log and exits; the second every machine's, each
+prefixed by its topic. MQTT Explorer shows the same topics in a tree. On the
+machine itself: `restic-ctl log --run` for the last run, `restic-ctl log --problem`
+for the last one that did not end `ok`, kept even after later good runs.
+
 ## Retiring a machine
 
-`restic-ctl unpublish` sends empty retained messages to both topics: Home Assistant
-removes the device and its entities, and the broker forgets the state. The next
+`restic-ctl unpublish` sends empty retained messages to all three topics: Home
+Assistant removes the device and its entities, and the broker forgets the state and
+the log. The next
 backup would announce the machine again, so stop the schedule first:
 
 ```

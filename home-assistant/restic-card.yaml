@@ -1,0 +1,25 @@
+# Dashboard card: every machine whose last backup did not end ok, with the reason,
+# the log line that says it, the hint and the last lines of its log.
+# Dashboard > Edit > Add card > Manual, and paste this.
+
+type: markdown
+title: Backups needing attention
+content: |
+  {% set ns = namespace(n=0) %}
+  {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_outcome$') %}
+  {% if states(e) not in ['ok', 'unknown', 'unavailable'] %}
+  {% set ns.n = ns.n + 1 %}
+  ### {{ device_attr(e, 'name') }}: {{ states(e) }}{{ (' - ' ~ state_attr(e, 'reason')) if state_attr(e, 'reason') else '' }}
+
+  {{ state_attr(e, 'finishedAt') }}, phase {{ state_attr(e, 'phase') or '-' }}
+
+  **{{ state_attr(e, 'message') or 'no diagnosis (older version, or never run)' }}**
+
+  *{{ state_attr(e, 'hint') or '' }}*
+
+  ```
+  {{ state_attr(e, 'logTail') or '' }}
+  ```
+  {% endif %}
+  {% endfor %}
+  {% if ns.n == 0 %}All backups ok.{% endif %}

@@ -1,0 +1,76 @@
+# Home Assistant package for the EasyResticSetup fleet.
+#
+# Copy to <config>/packages/restic.yaml (packages must be enabled once in
+# configuration.yaml - see HOME-ASSISTANT.md, "Installing it"), point the notify
+# action below at a real target, check the configuration, then reload Template
+# entities and Automations (or restart, the first time).
+#
+# One sensor and one automation for the whole fleet: machines announce themselves
+# with MQTT discovery, nothing here is per machine.
+
+template:
+  - sensor:
+      - name: "Restic attention"
+        unique_id: restic_attention
+        icon: mdi:backup-restore
+        # How many problems need a look; the list is in the "machines" attribute. The
+        # same loop as below, counted: a template sensor's state cannot read its own
+        # attributes.
+        state: >
+          {% set ns = namespace(l=[]) %}
+          {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
+            {% set t = states(e) | as_datetime(none) %}
+            {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
+            {% set vp = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_verification_problem') %}
+            {% set dc = states(e | replace('_last_run', '_last_data_check')) | as_datetime(none) %}
+            {% if t is none or now() - t > timedelta(hours=36) or is_state(p, 'on') %}
+              {% set ns.l = ns.l + [e] %}
+            {% endif %}
+            {% if is_state(vp, 'on') %}{% set ns.l = ns.l + [vp] %}{% endif %}
+            {% if dc is not none and now() - dc > timedelta(hours=72) %}{% set ns.l = ns.l + [e] %}{% endif %}
+          {% endfor %}
+          {{ ns.l | count }}
+        attributes:
+          machines: >
+            {% set ns = namespace(l=[]) %}
+            {% for e in integration_entities('mqtt') | select('match', 'sensor\.restic_.+_last_run$') %}
+              {% set n = device_attr(e, 'name') %}
+              {% set t = states(e) | as_datetime(none) %}
+              {% set p = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_problem') %}
+              {% set o = states(e | replace('_last_run', '_outcome')) %}
+              {% set vp = e | replace('sensor.', 'binary_sensor.') | replace('_last_run', '_verification_problem') %}
+              {% set v = states(e | replace('_last_run', '_verification')) %}
+              {% set dc = states(e | replace('_last_run', '_last_data_check')) | as_datetime(none) %}
+              {% if t is none or now() - t > timedelta(hours=36) %}
+                {% set ns.l = ns.l + [n ~ ': no run in 36 h (' ~ o ~ ')'] %}
+              {% elif is_state(p, 'on') %}
+                {# The diagnosis, when the machine sends one: "failed - nas-unreachable: ssh: ..." #}
+                {% set oe = e | replace('_last_run', '_outcome') %}
+                {% set m = state_attr(oe, 'message') %}
+                {% set why = (' - ' ~ state_attr(oe, 'reason') ~ ': ' ~ m) if m else '' %}
+                {% set ns.l = ns.l + [n ~ ': ' ~ o ~ why] %}
+              {% endif %}
+              {% if is_state(vp, 'on') %}
+                {% set ns.l = ns.l + [n ~ ': verification ' ~ v] %}
+              {% endif %}
+              {% if dc is not none and now() - dc > timedelta(hours=72) %}
+                {% set ns.l = ns.l + [n ~ ': no data check in 72 h'] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.l }}
+
+automation:
+  - id: restic_attention_notify
+    alias: "Restic: a machine needs attention"
+    triggers:
+      - trigger: state
+        entity_id: sensor.restic_attention
+    conditions:
+      - condition: template
+        value_template: >
+          {{ trigger.to_state.state | int(0) > trigger.from_state.state | int(0) }}
+    actions:
+      - action: notify.notify
+        data:
+          title: "Backups"
+          message: "{{ state_attr('sensor.restic_attention', 'machines') | join('\n') }}"
