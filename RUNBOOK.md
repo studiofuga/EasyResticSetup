@@ -933,6 +933,16 @@ Written and syntax-checked, but not yet exercised against the real NAS:
   on both platforms with symlinks in the snapshot and with a symlink replaced by a
   file afterwards. A prune frozen by the old behaviour stays frozen until
   `restic-ctl unfreeze`
+- **Backup and data check at the same time** (2026-10-09). A real failure: a Windows
+  PC asleep through both the 13:00 backup and the 15:00 check ran both missed tasks
+  at once on waking; the check took the exclusive lock first and the backup failed
+  with `repo-locked`. The backup and its prune now wait for the lock
+  (`--retry-lock 90m`), and the check waits 30 seconds and skips its turn if the
+  backup is running. On Linux that check had a bug of its own: `systemctl is-active`
+  says no to a oneshot service that is running (`activating`). Tested on Linux with
+  a real `restic check --read-data` holding the lock while a backup waited and then
+  succeeded; the Windows script under PowerShell 7, where `Get-ScheduledTask` does
+  not exist, so the task-state check itself is untested
 - no **restore** has been verified on any machine. This is the real gap, not a detail:
   a backup that has never been restored from is a hypothesis. `restic-ctl help restore`
   lists three ways to test one without needing free disk space

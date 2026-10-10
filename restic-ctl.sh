@@ -45,7 +45,7 @@
 set -u
 
 # Same stamp as the installers and restic-ctl.ps1: the version of the whole set.
-CTL_VERSION='2026.10.09.2'
+CTL_VERSION='2026.10.09.3'
 
 BASE='/etc/restic'
 SERVICE='restic-backup.service'

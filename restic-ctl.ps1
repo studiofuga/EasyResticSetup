@@ -119,7 +119,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$CtlVersion = '2026.10.09.2'
+$CtlVersion = '2026.10.09.3'
 
 # Which parameters were actually typed. "schedule -TimeLimitHours 0" has to be told
 # apart from "schedule" with the default still sitting there.

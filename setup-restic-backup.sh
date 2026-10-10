@@ -30,7 +30,7 @@ set -u
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-SCRIPT_VERSION='2026.10.09.2'
+SCRIPT_VERSION='2026.10.09.3'
 
 # ---- defaults ---------------------------------------------------------------
 # No default on purpose: nothing site-specific is baked into this script. The NAS
@@ -1679,7 +1679,8 @@ def last_match(text, pattern):
 def diagnose(lines, phase):
     scope = lines
     if phase == "prune":
-        starts = [i for i, l in enumerate(lines) if ">> restic forget" in l]
+        # ">> restic --retry-lock 90m forget --prune ...": options may come first.
+        starts = [i for i, l in enumerate(lines) if re.search(r">> restic .*\bforget\b", l)]
         if starts:
             scope = lines[starts[-1]:]
     text = [clean(l) for l in scope]
@@ -2159,11 +2160,17 @@ VERIFY_SAMPLE_PY_EOF
 #  Exit: 0 ok or skipped, 1 failed, 2 error.
 # =============================================================================
 verify_data() {
-    if systemctl is-active --quiet restic-backup.service 2>/dev/null; then
-        log 'verify-data: skipped, a backup is running; the subset is tried again next time'
-        echo 'skipped: a backup is running'
-        return 0
-    fi
+    # The backup goes first. Both timers are Persistent, so a machine that was off at
+    # both times starts them together when it comes back: wait a moment for the backup
+    # to show up, then step aside. "activating" is how systemd shows a oneshot service
+    # that is running - "is-active --quiet" alone says no to it.
+    sleep 30
+    case "$(systemctl is-active restic-backup.service 2>/dev/null)" in
+        active|activating)
+            log 'verify-data: skipped, a backup is running; the subset is tried again next time'
+            echo 'skipped: a backup is running'
+            return 0 ;;
+    esac
     python3 - "$VERIFY_SUBSETS" "$SFTP_COMMAND" "$LOG" "$VERIFY_STATE" "$FROZEN" \
         <<'VERIFY_DATA_PY_EOF'
 import datetime, json, os, re, subprocess, sys, time
@@ -2281,6 +2288,10 @@ fi
 
 RUN_STARTED="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 RUN_EPOCH="$(date +%s)"
+# A data check holds the repository lock exclusively for as long as it reads, half an
+# hour or more. A backup that meets it waits for it to finish instead of failing.
+RETRY_LOCK='90m'
+
 # Where this run's part of the log starts: the diagnosis and last-run.log read from
 # here on. The log is rotated only at startup, above, so the offset holds all run.
 RUN_LOG_OFFSET="$(stat -c %s "$LOG" 2>/dev/null || echo 0)"
@@ -2338,8 +2349,8 @@ elif [ "$INTERRUPTED" = 1 ]; then
     # Stopped before restic even started: record that instead of starting it.
     rc=130
 else
-    restic -o "sftp.command=$SFTP_COMMAND" backup --json --exclude-caches \
-        --exclude-if-present .nobackup \
+    restic -o "sftp.command=$SFTP_COMMAND" --retry-lock "$RETRY_LOCK" backup --json \
+        --exclude-caches --exclude-if-present .nobackup \
         --exclude-file "$EXCLUDE_FILE" --tag scheduled $RUN_PATHS 2>&1 | filter_json_progress
     rc=$?
 fi
@@ -2401,7 +2412,7 @@ if [ -f "$FROZEN" ]; then
     exit 0
 fi
 
-run_restic forget --prune \
+run_restic --retry-lock "$RETRY_LOCK" forget --prune \
     --keep-daily "$KEEP_DAILY" \
     --keep-weekly "$KEEP_WEEKLY" \
     --keep-monthly "$KEEP_MONTHLY"

@@ -196,7 +196,7 @@ $ErrorActionPreference = 'Stop'
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-$ScriptVersion = '2026.10.09.2'
+$ScriptVersion = '2026.10.09.3'
 
 # Which parameters the caller actually typed, as opposed to the ones that fell back
 # to a default. This is the whole basis of the configuration handling below: a
@@ -2280,6 +2280,17 @@ function Invoke-VerifySample([string]$SnapRef) {
 #  Returns 0 ok or skipped, 1 failed, 2 error.
 # =============================================================================
 function Invoke-VerifyData {
+    # The backup goes first. Both tasks start when available, so a PC that was off or
+    # asleep at both times starts them together when it comes back: wait a moment for
+    # the backup to show up, then step aside. The task name is the installer's default;
+    # the process check below covers a renamed one once its restic is running.
+    Start-Sleep -Seconds 30
+    $backupTask = Get-ScheduledTask -TaskName 'restic-backup' -ErrorAction SilentlyContinue
+    if ($backupTask -and "$($backupTask.State)" -eq 'Running') {
+        Write-Log 'verify-data: skipped, a backup is running; the subset is tried again next time'
+        $script:VerifyMessage = 'skipped: a backup is running'
+        return 0
+    }
     if (Get-Process -Name restic -ErrorAction SilentlyContinue) {
         Write-Log 'verify-data: skipped, restic is already running; the subset is tried again next time'
         $script:VerifyMessage = 'skipped: restic is already running'
@@ -2534,7 +2545,8 @@ function Get-Diagnosis([string]$Mode, [string]$Outcome, [int]$Rc, [string]$Phase
     $scope = $lines
     if ($Phase -eq 'prune') {
         for ($i = $lines.Count - 1; $i -ge 0; $i--) {
-            if ($lines[$i].Contains('>> restic forget')) { $scope = $lines[$i..($lines.Count - 1)]; break }
+            # ">> restic --retry-lock 90m forget --prune ...": options may come first.
+            if ($lines[$i] -match '>> restic .*\bforget\b') { $scope = $lines[$i..($lines.Count - 1)]; break }
         }
     }
     $text = @($scope | ForEach-Object { ConvertTo-CleanLine $_ })
@@ -2760,7 +2772,10 @@ Write-Manifest
 # --exclude-if-present .nobackup: a folder holding a file of that name is left out,
 # wherever it is. The marker travels with the folder, so excluding something that may
 # move needs no edit of excludes.txt.
-$backupArgs = @('backup', '--json', '--use-fs-snapshot', '--exclude-caches',
+# --retry-lock: a data check holds the repository lock exclusively for as long as it
+# reads, half an hour or more. A backup that meets it waits for it to finish instead
+# of failing; so does the prune below.
+$backupArgs = @('--retry-lock', '90m', 'backup', '--json', '--use-fs-snapshot', '--exclude-caches',
                 '--exclude-if-present', '.nobackup',
                 '--exclude-file', (Join-Path $Base 'excludes.txt'), '--tag', 'scheduled')
 if ($DryRun) { $backupArgs += '--dry-run' }
@@ -2830,7 +2845,7 @@ if (Test-Path $FrozenFile) {
     exit 0
 }
 
-$rc = Invoke-Restic (@('forget', '--prune') + $KeepArgs)
+$rc = Invoke-Restic (@('--retry-lock', '90m', 'forget', '--prune') + $KeepArgs)
 if ($rc -ne 0) {
     Write-Log "forget/prune FAILED (exit $rc)"
     # Same run, outcome corrected: the snapshot exists, but the repository was not

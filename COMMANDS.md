@@ -850,6 +850,13 @@ snapshot; then forget/prune - unless `prune-frozen.json` exists, in which case t
 prune is skipped and logged; finally cut this run's part of the log out into
 `last-run.log` and publish to Home Assistant.
 
+The backup and the data check never fight over the repository lock. The check holds
+it exclusively while it reads, so the backup and its prune run with
+`--retry-lock 90m` and wait for it rather than fail. The check, for its part, waits
+30 seconds and then steps aside if the backup is running: both are scheduled with
+catch-up (`Persistent=true`, *start when available*), so a machine that was off at
+both times starts them together when it comes back.
+
 Whatever ends the run, it leaves a record and a report. A stop signal (shutdown,
 suspend, `systemctl stop`, Ctrl+C) is recorded as `interrupted`, and nothing new is
 started after it. On Linux an unexpected exit of the script itself (`set -u`, a
