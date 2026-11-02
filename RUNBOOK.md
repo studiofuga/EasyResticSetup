@@ -750,9 +750,12 @@ What to do:
    `verify-data:`, and restic's own output right after them.
 2. Widen the look: `restic-ctl check --data` re-reads more of the repository.
 3. A `mismatch` on a single file that was being written at the time can be a false
-   alarm - the comparison only uses files whose modification time is older than the
-   snapshot, but an application that rewrites a file and restores its timestamp
-   defeats that. Check the file named in the log.
+   alarm. On Linux the comparison only uses files whose mtime *and* ctime are older
+   than the snapshot, which rules out both a rewrite and a rename (cupsd's `.O`
+   rotation); on Windows it goes by modification time and size only, so an
+   application that rewrites a file and restores its timestamp can still defeat it.
+   Check the file named in the log: `stat` it, and if its Change time is after the
+   snapshot, it was altered afterwards and the alarm is false.
 4. If restic reports damaged packs or snapshots, its own tools are
    `restic-ctl exec repair packs` and `restic-ctl exec repair snapshots`. Nothing is
    ever repaired automatically.
@@ -932,6 +935,18 @@ Written and syntax-checked, but not yet exercised against the real NAS:
   run - lock, network, a stop signal - is an `error`, which does not freeze. Tested
   on both platforms with symlinks in the snapshot and with a symlink replaced by a
   file afterwards. A prune frozen by the old behaviour stays frozen until
+  `restic-ctl unfreeze`
+- **Sample check and rotated files** (2026-11-02). A real false alarm: the sample
+  picked `/etc/cups/subscriptions.conf.O`, which cupsd replaces on every save by
+  renaming the live file over it. A rename keeps the moved file's mtime and only sets
+  its ctime, so the file passed the "unchanged since the snapshot" test on mtime alone
+  and then hashed differently. The Linux comparison now also requires the ctime to be
+  before the snapshot started and unchanged after hashing; `touch` cannot move a ctime
+  back, so a rotated or altered file is skipped instead of compared. Reproduced with a
+  rename fixture (old guard compares, new guard skips). Linux only: the Windows check
+  still goes by LastWriteTime and size. NTFS has a ChangeTime, but reading it needs a
+  P/Invoke that has not been written or tested here, and rename-rotation of backup
+  copies is a Unix habit. A prune frozen by the old behaviour stays frozen until
   `restic-ctl unfreeze`
 - **Backup and data check at the same time** (2026-10-09). A real failure: a Windows
   PC asleep through both the 13:00 backup and the 15:00 check ran both missed tasks

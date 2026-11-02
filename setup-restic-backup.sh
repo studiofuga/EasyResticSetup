@@ -30,7 +30,7 @@ set -u
 # running from the copy already installed on the machine, and refuse to replace a newer
 # one with an older. A hash is compared too, because a version I forgot to bump would
 # otherwise hide a real difference.
-SCRIPT_VERSION='2026.10.09.3'
+SCRIPT_VERSION='2026.11.02.1'
 
 # ---- defaults ---------------------------------------------------------------
 # No default on purpose: nothing site-specific is baked into this script. The NAS
@@ -1917,8 +1917,8 @@ manifest_backup_paths() {
 #  this run actually uploaded - within VERIFY_SAMPLE_MIB, and reads each one back
 #  with "restic dump", hashing the stream: nothing is written to disk. restic checks
 #  every blob as it decrypts it, so a dump that completes is intact data. When the
-#  live file has not changed since the snapshot started, its hash is compared too,
-#  which also catches "backed up the wrong thing".
+#  live file has not changed since the snapshot started (neither mtime nor ctime is
+#  after it), its hash is compared too, which also catches "backed up the wrong thing".
 #
 #  Outcomes: ok; skipped (nothing suitable to sample); failed (a dump failed twice);
 #  mismatch (a dump differs from an unchanged original); error (the sample could not
@@ -2104,9 +2104,16 @@ try:
                 continue
             try:
                 st = os.stat(path)
-                if st.st_mtime < snap_time and st.st_size == n:
+                # ctime as well as mtime. A rename (cupsd rotating subscriptions.conf to
+                # .O, logrotate, any "mv old new") keeps the mtime of the file that moved
+                # but sets its ctime, and touch(1) cannot move a ctime back. So a file
+                # whose ctime is after the snapshot started was replaced or altered
+                # since: it is no longer "the unchanged original" and is not compared.
+                if (st.st_mtime < snap_time and st.st_ctime < snap_time
+                        and st.st_size == n):
                     live = live_hash(path)
-                    if os.stat(path).st_mtime == st.st_mtime:
+                    st2 = os.stat(path)
+                    if st2.st_mtime == st.st_mtime and st2.st_ctime == st.st_ctime:
                         result["compared"] += 1
                         if live != digest:
                             result["problems"].append(
