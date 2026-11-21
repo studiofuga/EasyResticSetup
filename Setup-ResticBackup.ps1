@@ -3102,13 +3102,20 @@ if (Should-Run 6) {
 if (Should-Run 7) {
     Write-Step 7 'restic repository'
 
-    $null = Invoke-Restic @('cat', 'config')
+    $catOut = Invoke-Restic @('cat', 'config')
     if ($LASTEXITCODE -eq 0) {
         Write-Info 'repository already initialised'
     } else {
+        # cat config failed. If init then says the config exists, the repository is there
+        # and cat failed for another reason (password, ssh/sftp, network): show that error
+        # instead of reporting a bogus init failure.
         $out = Invoke-Restic @('init')
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "repository created at $Repository"
+        } elseif (($out -join ' ') -match 'config (file )?already exists') {
+            Write-Fail 'repository exists, but restic cat config failed:'
+            Write-Info ($catOut -join ' ')
+            exit 1
         } else {
             Write-Fail 'restic init failed'
             Write-Info ($out -join ' ')
