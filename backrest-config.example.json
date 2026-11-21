@@ -1,0 +1,45 @@
+{
+  "version": 4,
+  "instance": "<machine-name>",
+  "repos": [
+    {
+      "id": "nas-restic",
+      "uri": "sftp:nas-restic:<repo-path>",
+      "env": [
+        "RESTIC_PASSWORD_FILE=C:\\ProgramData\\restic\\password",
+        "RESTIC_CACHE_DIR=C:\\ProgramData\\restic\\cache"
+      ],
+      "flags": [
+        "-o",
+        "sftp.command=ssh -F C:/ProgramData/restic/ssh/config -o BatchMode=yes nas-restic -s sftp"
+      ]
+    }
+  ],
+  "plans": [
+    {
+      "id": "backup-nas-restic",
+      "repo": "nas-restic",
+      "paths": [
+        "<backup-path-1>",
+        "C:\\ProgramData\\restic\\manifest"
+      ],
+      "excludes": [
+        "<pattern-from-excludes.txt>"
+      ],
+      "schedule": {
+        "clock": "CLOCK_LOCAL",
+        "cron": "0 13 * * *"
+      },
+      "retention": {
+        "policyTimeBucketed": {
+          "daily": 14,
+          "weekly": 8,
+          "monthly": 12
+        }
+      },
+      "backupFlags": [
+        "--use-fs-snapshot"
+      ]
+    }
+  ]
+}
